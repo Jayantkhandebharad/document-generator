@@ -1,19 +1,18 @@
-import base64
+import logging
 import os
-import tempfile
 
 from docx import Document
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+_log = logging.getLogger(__name__)
 from docx.shared import Inches
 
-from utils.docx_to_images import docx_to_page_images, docx_to_page_images_base64, ocr_page_images
 from utils.formatter import (
     clear_document_body,
     force_legal_run_format_document,
-    force_single_column,
-    inject_blocks,
+    render_document_by_region,
     remove_trailing_empty_and_noise,
 )
-from utils.llm_formatter import format_text_with_llm
 from utils.style_extractor import (
     _paragraph_has_bottom_border,
     extract_document_blueprint,
@@ -22,6 +21,7 @@ from utils.style_extractor import (
     save_document_blueprint,
     save_extracted_styles,
 )
+from utils.zone_parser import extract_all_captions, parse_caption_structured, parse_regions
 
 # Summons-style page margins (generous, like formal legal documents)
 DEFAULT_TOP_MARGIN_IN = 1.25
@@ -72,79 +72,48 @@ def extract_and_store_styles(template_file) -> dict:
 
 def process_document(generated_text, template_file):
     """
-    Input 1: Uploaded DOCX template (desired styles and formatting).
-    Input 2: Raw legal text (unformatted).
-    Segment and render entire text using template styles (no slot-fill).
-    Uses LLM to segment and label; template page images (and OCR text) are generated and sent to the LLM when available.
+    Region-aware layout: layout dictates where content goes (no slot-fill for structure).
+    Step 1 — Deterministic region extraction: caption, summons_intro, body, wherefore, signature, verification, footer.
+    Step 2 — Render region by region in fixed order. Caption = table only. Divider only in caption and footer; never in body.
     """
+    _log.info("process_document: start")
     project_dir = _project_dir()
+    _log.info("process_document: loading template (Document)")
     doc = Document(template_file)
     _apply_default_margins(doc)
 
+    _log.info("process_document: extract_styles + save")
     schema = extract_styles(doc)
     save_extracted_styles(schema, base_dir=project_dir)
 
-    # Always generate template page images so the LLM can use them when the LLM path is used
-    try:
-        template_file.seek(0)
-        data = template_file.read()
-        template_file.seek(0)
-        with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
-            tmp.write(data)
-            tmp.flush()
-            template_path = tmp.name
-        doc_for_images = Document(template_path)
-        force_single_column(doc_for_images)
-        fd, single_column_path = tempfile.mkstemp(suffix=".docx")
-        os.close(fd)
-        doc_for_images.save(single_column_path)
-        page_bytes = docx_to_page_images(single_column_path, dpi=150, max_pages=15)
-        if page_bytes:
-            schema["template_page_images"] = [base64.b64encode(b).decode("ascii") for b in page_bytes]
-            template_page_ocr_texts = ocr_page_images(page_bytes)
-            if template_page_ocr_texts and any(t.strip() for t in template_page_ocr_texts):
-                schema["template_page_ocr_texts"] = template_page_ocr_texts
-        for path in (single_column_path, template_path):
-            if path and os.path.isfile(path):
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
-    except Exception:
-        pass
+    # Step 1 — Deterministic region extraction and caption instances (no LLM)
+    _log.info("process_document: parse_regions")
+    regions = parse_regions(generated_text or "")
+    schema["regions"] = regions
+    _log.info("process_document: extract_all_captions")
+    caption_instances = extract_all_captions(generated_text or "")
+    if not caption_instances and regions.get("caption"):
+        # Fallback: single caption at top from zones
+        structured = parse_caption_structured(regions["caption"])
+        if structured:
+            caption_instances = [{"type": "summons_caption", "text": regions["caption"], "structured": structured}]
+    schema["caption_instances"] = caption_instances
 
-    blocks = []
-    try:
-        blocks = format_text_with_llm(
-            generated_text,
-            schema,
-            use_slot_fill=False,
-            template_page_images=schema.get("template_page_images") or [],
-            template_page_ocr_texts=schema.get("template_page_ocr_texts") or [],
-        )
-    except Exception:
-        pass
-
+    _log.info("process_document: clear_document_body")
     clear_document_body(doc)
-    # Preserve template's section/column layout (do not force single-column so two-column claimant/attorney blocks match template)
-    inject_blocks(
-        doc,
-        blocks,
-        style_map=schema["style_map"],
-        style_formatting=schema.get("style_formatting", {}),
-        line_samples=schema.get("line_samples", []),
-        section_heading_samples=schema.get("section_heading_samples", []),
-        template_structure=None,
-        numbered_num_id=schema.get("numbered_num_id"),
-        numbered_ilvl=schema.get("numbered_ilvl", 0),
-        bold_phrases_from_template=schema.get("bold_phrases_from_template"),
-        caption_table_layout=schema.get("caption_table_layout"),
-    )
+    # Step 2 — Render by region; caption instances in controlled positions (summons/complaint/footer)
+    _log.info("process_document: render_document_by_region")
+    render_document_by_region(doc, regions, caption_instances, schema)
+    _log.info("process_document: force_legal_run_format_document")
     force_legal_run_format_document(doc)
+    _log.info("process_document: remove_trailing_empty_and_noise")
     remove_trailing_empty_and_noise(doc)
 
     output_path = os.path.join(project_dir, "output", "formatted_output.docx")
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    _log.info("process_document: doc.save")
     doc.save(output_path)
+    _log.info("process_document: get_document_preview_text")
     preview_text = get_document_preview_text(output_path)
+    _log.info("process_document: done")
     return output_path, preview_text

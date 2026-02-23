@@ -262,7 +262,7 @@ def _extract_run_format_from_font(font) -> dict:
     try:
         if hasattr(font, "color") and font.color and getattr(font.color, "rgb", None):
             rgb = font.color.rgb
-            if rgb is not None and len(rgb) >= 3:
+            if rgb is not None and len(rgb) >= 3 and all(rgb[i] is not None for i in range(3)):
                 out["color_rgb_hex"] = "%02x%02x%02x" % (int(rgb[0]), int(rgb[1]), int(rgb[2]))
     except Exception:
         pass

@@ -1,9 +1,12 @@
+import logging
 import re
 
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING, WD_TAB_ALIGNMENT, WD_TAB_LEADER, WD_UNDERLINE
+
+_log_formatter = logging.getLogger(__name__)
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Pt, RGBColor
+from docx.shared import Inches, Pt, RGBColor
 
 # Section underline (thin bottom border) for headings
 try:
@@ -11,6 +14,7 @@ try:
 except Exception:
     _paragraph_border_bottom = None
 from utils.style_extractor import build_style_map_from_doc, _paragraph_has_bottom_border
+from utils.zone_parser import strip_embedded_caption_text
 
 # Unicode checkbox characters for rendering
 CHECKBOX_UNCHECKED = "\u2610"  # ☐
@@ -207,9 +211,10 @@ def _split_allegation_block(text: str) -> list[str]:
     return out if out else [text]
 
 
-# Style names that are body text — always justify, never center; never inherit template italic
+# Style names that are body text — left-align, never justify; never inherit template center/italic
 BODY_STYLE_NAMES = ("normal", "body text", "list paragraph", "list number", "list")
 
+# Legal pleading alignment: body/signature/verification LEFT; caption CENTER; never justify body
 def _block_type_for_alignment(block_kind: str, section_type: str, style_name: str = "") -> str:
     """Map block_kind + section_type to alignment block_type for enforce_legal_alignment."""
     if block_kind == "line":
@@ -218,10 +223,8 @@ def _block_type_for_alignment(block_kind: str, section_type: str, style_name: st
         return "signature"
     if block_kind == "section_underline":
         return "paragraph"
-    # Body styles: always justify (prevent template center/italic from leaking)
     if (style_name or "").strip().lower() in BODY_STYLE_NAMES:
         return "paragraph"
-    # Content slots: use section_type
     if section_type in ("caption",):
         return "section_header"
     if section_type in ("attorney_signature", "notary"):
@@ -232,13 +235,19 @@ def _block_type_for_alignment(block_kind: str, section_type: str, style_name: st
 
 
 def enforce_legal_alignment(block_type: str, paragraph):
-    """Override alignment only for body text (justify). Non-body blocks keep template alignment (center, right, etc.)."""
+    """Legal pleading alignment: body/signature/verification LEFT; caption header CENTER; footer CENTER. Never justify body."""
     if not paragraph:
         return
     try:
         if block_type in ("paragraph", "numbered", "body"):
-            paragraph.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-        # heading, section_header, signature, address, to_section, line: leave as set by _apply_paragraph_format (template)
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        elif block_type == "section_header":
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        elif block_type == "signature":
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        elif block_type == "footer":
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        # line, to_section: leave from template
     except Exception:
         pass
 
@@ -332,15 +341,19 @@ def _apply_paragraph_format(paragraph, fmt: dict):
             val = fmt["line_spacing"]
             rule_name = fmt.get("line_spacing_rule")
             rule = getattr(WD_LINE_SPACING, rule_name, None) if isinstance(rule_name, str) else None
-            # EXACTLY or AT_LEAST: use fixed height in points
-            if rule in (WD_LINE_SPACING.EXACTLY, WD_LINE_SPACING.AT_LEAST):
+            # Avoid tight EXACT spacing (e.g. 12pt): use MULTIPLE 1.5 for legal readability
+            if rule == WD_LINE_SPACING.EXACTLY and isinstance(val, (int, float)) and val < 18:
+                pf.line_spacing = 1.5
+                pf.line_spacing_rule = WD_LINE_SPACING.MULTIPLE
+            elif rule in (WD_LINE_SPACING.EXACTLY, WD_LINE_SPACING.AT_LEAST):
                 pf.line_spacing = Pt(val) if isinstance(val, (int, float)) else val
                 pf.line_spacing_rule = rule
-            # MULTIPLE, SINGLE, DOUBLE, ONE_POINT_FIVE: use multiplier (float)
             else:
                 num = float(val) if isinstance(val, (int, float)) else None
                 if num is not None and 0.25 <= num <= 3.0:
                     pf.line_spacing = num
+                    if rule is not None:
+                        pf.line_spacing_rule = rule
     except Exception:
         pass
     for attr in ("page_break_before", "keep_with_next", "keep_together"):
@@ -563,6 +576,17 @@ DEFAULT_SIGNATURE_LINE = "_________________________"
 DEFAULT_LINE = "----------------------------------------------------------------------X"
 
 
+def _is_dashed_line_only(line: str) -> bool:
+    """True if line is only a dashed/underscore/equals separator (e.g. ---, ===, ______). Used to avoid injecting raw dividers in body/signature/verification/footer."""
+    t = (line or "").strip()
+    if not t or len(t) < 3:
+        return bool(not t or not t.strip())
+    core = t.rstrip("Xx").rstrip()
+    if not core:
+        return True
+    return all(c in "-_=\t " for c in core) and len(core) >= 3
+
+
 def _add_bottom_border_to_paragraph(paragraph, pt=0.5, dashed=False):
     """Add a thin bottom border to a paragraph (separator line spans full width). Use dashed=True for ----------- style."""
     try:
@@ -571,13 +595,35 @@ def _add_bottom_border_to_paragraph(paragraph, pt=0.5, dashed=False):
         pBdr = OxmlElement("w:pBdr")
         bottom = OxmlElement("w:bottom")
         bottom.set(qn("w:val"), "dashed" if dashed else "single")
-        bottom.set(qn("w:sz"), str(int(pt * 8)))
+        pt_val = pt if pt is not None else 0.5
+        bottom.set(qn("w:sz"), str(int(pt_val * 8)))
         bottom.set(qn("w:space"), "1")
         bottom.set(qn("w:color"), "000000")
         pBdr.append(bottom)
         pPr.append(pBdr)
     except Exception:
         pass
+
+
+def add_full_width_line(doc, size=12):
+    """
+    Court-accurate full-width divider: paragraph bottom border only (no = or - text).
+    Full width, margin aware, consistent. size: 12 = thin court line, 18 = heavier caption divider, 24 = bold.
+    """
+    if not doc:
+        return
+    p = doc.add_paragraph()
+    p.paragraph_format.space_before = Pt(6)
+    p.paragraph_format.space_after = Pt(6)
+    pPr = p._p.get_or_add_pPr()
+    pBdr = OxmlElement("w:pBdr")
+    bottom = OxmlElement("w:bottom")
+    bottom.set(qn("w:val"), "single")
+    bottom.set(qn("w:sz"), str(size))
+    bottom.set(qn("w:space"), "1")
+    bottom.set(qn("w:color"), "000000")
+    pBdr.append(bottom)
+    pPr.append(pBdr)
 
 
 def _add_full_width_separator(doc, style=None, space_after_pt=None, dashed=False):
@@ -623,6 +669,8 @@ BODY_START_PHRASES = (
     "under the penalties of perjury",
     "being duly sworn",
     "duly sworn, says",
+    "to the above named defendant",
+    "to the above-named defendant",
 )
 # Right-column caption: index number and motion/document title (placed right-aligned, index on same line as plaintiff when merged)
 RIGHT_CAPTION_PHRASES = (
@@ -670,6 +718,596 @@ SPACE_BEFORE_SECTION_PT = 14.0
 SPACE_AFTER_CAPTION_PT = 10.0
 SPACE_BEFORE_SIGNATURE_PT = 18.0
 
+# Layout: explicit legal body and signature (do not rely on template alone)
+LEGAL_BODY_FIRST_LINE_INDENT_PT = 36.0
+LEGAL_BODY_LINE_SPACING_MULTIPLE = 1.5
+LEGAL_BODY_SPACE_AFTER_PT = 6.0
+LEGAL_SIGNATURE_LEFT_INDENT_PT = 216.0  # 3 inches
+DIVIDER_BORDER_SPACE_BEFORE_PT = 6.0
+DIVIDER_BORDER_SPACE_AFTER_PT = 6.0
+
+# Caption/footer: tab-stop and indent geometry (match sample template)
+CAPTION_RIGHT_TAB_INCHES = 6.5  # right-aligned tab for Index No. value
+CAPTION_PARTY_LEFT_INDENT_INCHES = 2.5  # plaintiff/defendant block indent (not center)
+
+# Caption table: fixed widths so left column is not narrow (no word-break). 6.5" printable width.
+CAPTION_TABLE_WIDTH_INCHES = 6.5
+CAPTION_LEFT_COLUMN_INCHES = 4.5
+CAPTION_RIGHT_COLUMN_INCHES = 2.0
+# Cell margins in dxa (1/20 pt) — small so content has room; default Word padding can shrink usable width
+CAPTION_CELL_MARGIN_DXA = 50
+
+# Caption renderer: table-based (2x2 header, no borders) matches court/screenshot layout. Set False for paragraph/tab or 7-row table.
+USE_TABLE_CAPTION_SCREENSHOT = True
+USE_PARAGRAPH_CAPTION = False
+
+# --- Layout renderer: table-based screenshot-accurate caption (2x2 header, divider, party, X, divider) ---
+
+def _caption_cell_borders_nil(cell):
+    """Remove all borders from a table cell (invisible table for layout)."""
+    try:
+        tc = cell._tc
+        tcPr = tc.get_or_add_tcPr()
+        for old in tcPr.findall(qn("w:tcBorders")):
+            tcPr.remove(old)
+        tcBorders = OxmlElement("w:tcBorders")
+        for edge in ("top", "left", "bottom", "right"):
+            elem = OxmlElement(f"w:{edge}")
+            elem.set(qn("w:val"), "nil")
+            tcBorders.append(elem)
+        tcPr.append(tcBorders)
+    except Exception:
+        pass
+
+
+def _render_caption_table_screenshot(doc, caption: dict, style_map: dict, style_formatting: dict, valid_style_names: set):
+    """
+    Court-accurate caption: 2x2 invisible table (header) + full-width divider + centered party block + right-aligned X + divider.
+    No tab stops; fixed column widths. Avoids PLAINTIFF,, and alignment collapse.
+    """
+    if not caption or not doc:
+        return
+    court = (caption.get("court") or "").strip().upper() or "SUPERIOR COURT"
+    county = (caption.get("county") or "").strip().upper() or "NEW HAVEN COUNTY"
+    plaintiff_raw = (caption.get("plaintiff") or "").strip()
+    defendant_raw = (caption.get("defendant") or "").strip()
+    index_no = (caption.get("index_no") or "").strip() or "__________"
+    # Name only (strip ", Plaintiff," / ", Defendant." to avoid duplicate and wrong punctuation)
+    plaintiff_name = re.sub(r",\s*Plaintiff\s*,?\s*$", "", plaintiff_raw, flags=re.I).strip() or plaintiff_raw
+    defendant_name = re.sub(r",\s*Defendant\s*\.?\s*$", "", defendant_raw, flags=re.I).strip() or defendant_raw
+    # Strip trailing commas so we never get "PLAINTIFF,," or "NAME,,"
+    plaintiff_name = plaintiff_name.rstrip(" ,")
+    defendant_name = defendant_name.rstrip(" ,.")
+
+    # HEADER TABLE (2 rows, 2 columns), no borders
+    table = doc.add_table(rows=2, cols=2)
+    table.autofit = False
+    try:
+        table.columns[0].width = Inches(3.5)
+        table.columns[1].width = Inches(3.0)
+    except Exception:
+        pass
+    for row in table.rows:
+        for cell in row.cells:
+            _caption_cell_borders_nil(cell)
+
+    # Row 1: Court | Index No.
+    c00 = table.cell(0, 0).paragraphs[0]
+    c00.clear()
+    c00.add_run(court).bold = True
+    c01 = table.cell(0, 1).paragraphs[0]
+    c01.clear()
+    c01.add_run("Index No.: " + index_no)
+    c01.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+
+    # Row 2: County | SUMMONS AND VERIFIED COMPLAINT
+    c10 = table.cell(1, 0).paragraphs[0]
+    c10.clear()
+    c10.add_run(county).bold = True
+    c11 = table.cell(1, 1).paragraphs[0]
+    c11.clear()
+    c11.add_run("SUMMONS AND VERIFIED COMPLAINT")
+    c11.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+
+    # Full-width divider (court-accurate paragraph border, not = or - text)
+    add_full_width_line(doc, size=12)
+
+    # Party block (centered, no duplicated commas)
+    party = doc.add_paragraph()
+    party.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    party.paragraph_format.space_before = Pt(12)
+    party.paragraph_format.space_after = Pt(12)
+    party.paragraph_format.left_indent = Pt(0)
+    party.paragraph_format.right_indent = Pt(0)
+    if plaintiff_name:
+        party.add_run(plaintiff_name.upper() + ",\n\n")
+    party.add_run("Plaintiff,\n\n")
+    party.add_run("-against-\n\n")
+    if defendant_name:
+        party.add_run(defendant_name.upper() + ",\n")
+    party.add_run("Defendant.")  # period only, no extra comma
+
+    # X (right-aligned)
+    x_para = doc.add_paragraph()
+    x_para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    x_para.add_run("X")
+
+    # Second full-width divider (court-accurate paragraph border)
+    add_full_width_line(doc, size=12)
+
+    doc.add_paragraph()  # spacing after caption
+
+
+# --- Paragraph-based caption (tab stops; fallback when USE_TABLE_CAPTION_SCREENSHOT is False) ---
+
+def _caption_right_tab_position(doc):
+    """Right margin position (from left) for caption tab stops so Index No. / COMPLAINT / X align flush right."""
+    try:
+        section = doc.sections[0]
+        # Content width in inches; tab stop at this position = right-aligned at margin
+        w = section.page_width.inches - section.left_margin.inches - section.right_margin.inches
+        return Inches(max(0.5, min(7.5, w)))
+    except Exception:
+        return Inches(CAPTION_RIGHT_TAB_INCHES)
+
+
+def _render_caption_geometry(doc, caption: dict, style_map: dict, style_formatting: dict, valid_style_names: set):
+    """
+    Caption using paragraph geometry only: tab stops, full-width borders, right-aligned X.
+    Matches screenshot layout (no table). Uses court, county, plaintiff, defendant, index_no from caption dict.
+    """
+    if not caption or not doc:
+        return
+    court = (caption.get("court") or "").strip().upper()
+    county = (caption.get("county") or "").strip().upper()
+    plaintiff = (caption.get("plaintiff") or "").strip()
+    defendant = (caption.get("defendant") or "").strip()
+    index_no = (caption.get("index_no") or "").strip() or "__________"
+    if not court:
+        court = "SUPERIOR COURT"
+    if not county:
+        county = "NEW HAVEN COUNTY"
+
+    tab_right = _caption_right_tab_position(doc)
+
+    # 1) Court  |  Index No.
+    p1 = doc.add_paragraph()
+    p1.paragraph_format.space_before = Pt(0)
+    p1.paragraph_format.space_after = Pt(0)
+    p1.paragraph_format.tab_stops.add_tab_stop(tab_right, WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.SPACES)
+    r1 = p1.add_run(court)
+    r1.bold = True
+    p1.add_run("\tIndex No.: " + index_no)
+
+    # 2) County  |  SUMMONS AND VERIFIED COMPLAINT
+    p2 = doc.add_paragraph()
+    p2.paragraph_format.space_after = Pt(6)
+    p2.paragraph_format.tab_stops.add_tab_stop(tab_right, WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.SPACES)
+    r2 = p2.add_run(county)
+    r2.bold = True
+    p2.add_run("\tSUMMONS AND VERIFIED COMPLAINT")
+
+    # 3) First full-width divider (court-accurate paragraph border)
+    add_full_width_line(doc, size=12)
+
+    # 4) Party block (centered)
+    party = doc.add_paragraph()
+    party.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    party.paragraph_format.space_before = Pt(12)
+    party.paragraph_format.space_after = Pt(12)
+    party.paragraph_format.left_indent = Pt(0)
+    party.paragraph_format.right_indent = Pt(0)
+    parts = []
+    if plaintiff:
+        parts.append(plaintiff.upper() + ",\n\n")
+    parts.append("Plaintiff,\n\n")
+    parts.append("-against-\n\n")
+    if defendant:
+        parts.append(defendant.upper() + ",\n")
+    parts.append("Defendant.")
+    for t in parts:
+        party.add_run(t)
+
+    # 5) Second full-width divider with right-aligned X (border on same para as X)
+    p_x = doc.add_paragraph()
+    p_x.paragraph_format.space_before = Pt(6)
+    p_x.paragraph_format.space_after = Pt(SPACE_AFTER_CAPTION_PT)
+    p_x.paragraph_format.tab_stops.add_tab_stop(tab_right, WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.SPACES)
+    p_x.add_run("\u00A0\tX")
+    _add_bottom_border_to_paragraph(p_x, pt=1.5, dashed=False)  # sz=12 (1.5pt) for court line
+
+
+# --- Table-based caption (fallback when USE_PARAGRAPH_CAPTION is False) ---
+
+def _set_table_width(table, width_inches: float):
+    """Set total table width so Word does not shrink. Prevents narrow column collapse."""
+    try:
+        tbl = table._tbl
+        tblPr = tbl.get_or_add_tblPr()
+        for old in tblPr.findall(qn("w:tblW")):
+            tblPr.remove(old)
+        tblW = OxmlElement("w:tblW")
+        tblW.set(qn("w:w"), str(int(Inches(width_inches).pt * 20)))
+        tblW.set(qn("w:type"), "dxa")
+        tblPr.append(tblW)
+    except Exception:
+        pass
+
+
+def _set_table_fixed_layout(table):
+    """Set table layout to fixed so Word does not recalculate column widths from content."""
+    try:
+        tbl = table._tbl
+        tblPr = tbl.get_or_add_tblPr()
+        for old in tblPr.findall(qn("w:tblLayout")):
+            tblPr.remove(old)
+        tblLayout = OxmlElement("w:tblLayout")
+        tblLayout.set(qn("w:type"), "fixed")
+        tblPr.append(tblLayout)
+    except Exception:
+        pass
+
+
+def _set_cell_margins(cell, top_dxa: int = 50, start_dxa: int = 50, bottom_dxa: int = 50, end_dxa: int = 50):
+    """Set cell margins (internal padding) so Word doesn't shrink usable width. Default 50 dxa (~2.5 pt)."""
+    try:
+        tc = cell._tc
+        tcPr = tc.get_or_add_tcPr()
+        tcMar = OxmlElement("w:tcMar")
+        for name, val in (("top", top_dxa), ("start", start_dxa), ("bottom", bottom_dxa), ("end", end_dxa)):
+            node = OxmlElement(f"w:{name}")
+            node.set(qn("w:w"), str(val))
+            node.set(qn("w:type"), "dxa")
+            tcMar.append(node)
+        tcPr.append(tcMar)
+    except Exception:
+        pass
+
+
+def _cell_paragraph_with_border(cell, space_before_pt=6, space_after_pt=6):
+    """Add a paragraph in cell with only a bottom border (layout element, not dash text)."""
+    p = cell.paragraphs[0] if cell.paragraphs else cell.add_paragraph()
+    p.clear()
+    p.add_run("\u00A0")
+    p.paragraph_format.space_before = Pt(space_before_pt)
+    p.paragraph_format.space_after = Pt(space_after_pt)
+    _add_bottom_border_to_paragraph(p, pt=0.5, dashed=False)
+    return p
+
+
+def _set_table_column_widths(table, left_width_inches: float = 4.5, right_width_inches: float = 2.0):
+    """Set two-column table widths explicitly so left column is wide enough (no word-break).
+    Word often ignores column-level width; set width on every cell so the left column is not narrow."""
+    try:
+        left = Inches(left_width_inches)
+        right = Inches(right_width_inches)
+        # 1) Grid (tblGrid) — column definitions
+        grid = table._tbl.tblGrid
+        grid_cols = grid.findall(qn("w:gridCol"))
+        if len(grid_cols) >= 2:
+            grid_cols[0].set(qn("w:w"), str(int(Inches(left_width_inches).pt * 20)))
+            grid_cols[1].set(qn("w:w"), str(int(Inches(right_width_inches).pt * 20)))
+        # 2) Column objects (python-docx)
+        try:
+            table.columns[0].width = left
+            table.columns[1].width = right
+        except Exception:
+            pass
+        # 3) Every cell — Word respects cell-level tcW; without this the left column can render narrow
+        for row in table.rows:
+            if len(row.cells) >= 2:
+                row.cells[0].width = left
+                row.cells[1].width = right
+    except Exception:
+        pass
+
+
+def _add_right_tab_stop(paragraph, position_inches: float = 6.5):
+    """Add a right-aligned tab stop so content after \\t aligns to right margin. Preserves layout geometry."""
+    try:
+        paragraph.paragraph_format.tab_stops.add_tab_stop(
+            Inches(position_inches), WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.SPACES
+        )
+    except Exception:
+        pass
+
+
+def _render_caption_table(doc, caption: dict, style_map: dict, style_formatting: dict, valid_style_names: set):
+    """Caption as 2-column table. Right column uses tab stops (Index No.:\\tvalue); party block uses left indent, not center. No blank paragraphs."""
+    if not caption or not doc:
+        return
+    default_style = style_map.get("section_header") or style_map.get("heading") or style_map.get("paragraph")
+    if not default_style or (valid_style_names and default_style not in valid_style_names):
+        default_style = list(valid_style_names)[0] if valid_style_names else "Normal"
+    run_fmt = (style_formatting.get(default_style) or {}).get("run_format") or {}
+    pf_fmt = (style_formatting.get(default_style) or {}).get("paragraph_format") or {}
+
+    def _cell_para(cell, text: str, align_center: bool = False, left_indent_inches: float | None = None):
+        p = cell.paragraphs[0] if cell.paragraphs else cell.add_paragraph()
+        p.clear()
+        if text:
+            r = p.add_run(text)
+            _apply_run_format(r, run_fmt)
+        _apply_paragraph_format(p, pf_fmt)
+        if left_indent_inches is not None:
+            p.paragraph_format.left_indent = Inches(left_indent_inches)
+            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        elif align_center:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        else:
+            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        return p
+
+    def _cell_para_right_tab(cell, before_tab: str, after_tab: str):
+        """Right column: label before tab, value after tab so value aligns to right (tab stop at 6.5")."""
+        p = cell.paragraphs[0] if cell.paragraphs else cell.add_paragraph()
+        p.clear()
+        if before_tab:
+            r0 = p.add_run(before_tab)
+            _apply_run_format(r0, run_fmt)
+        r1 = p.add_run("\t" + (after_tab or ""))
+        _apply_run_format(r1, run_fmt)
+        _apply_paragraph_format(p, pf_fmt)
+        _add_right_tab_stop(p, CAPTION_RIGHT_TAB_INCHES)
+        return p
+
+    # 7 rows, 2 cols: fixed widths so left column is not narrow (prevents "Plaint\niff," / "HENR\nY\nSARBI\nESKI," wrap)
+    table = doc.add_table(rows=7, cols=2)
+    table.autofit = False
+    if getattr(table, "allow_autofit", None) is not None:
+        table.allow_autofit = False
+    _set_table_width(table, CAPTION_TABLE_WIDTH_INCHES)
+    _set_table_fixed_layout(table)
+    _set_table_column_widths(table, left_width_inches=CAPTION_LEFT_COLUMN_INCHES, right_width_inches=CAPTION_RIGHT_COLUMN_INCHES)
+    for row in table.rows:
+        for cell in row.cells:
+            _set_cell_margins(cell, CAPTION_CELL_MARGIN_DXA, CAPTION_CELL_MARGIN_DXA, CAPTION_CELL_MARGIN_DXA, CAPTION_CELL_MARGIN_DXA)
+
+    # Row 0: court (left) | Index No.:\tvalue (right tab)
+    index_val = (caption.get("index_no") or "").strip() or "_________"
+    _cell_para(table.rows[0].cells[0], caption.get("court") or "", align_center=False)
+    _cell_para_right_tab(table.rows[0].cells[1], "Index No.: ", index_val)
+    # Row 1: county (left) | SUMMONS AND VERIFIED\tCOMPLAINT (right tab)
+    _cell_para(table.rows[1].cells[0], caption.get("county") or "", align_center=False)
+    _cell_para_right_tab(table.rows[1].cells[1], "SUMMONS AND VERIFIED ", "COMPLAINT")
+    # Row 2: horizontal rule (border) in left cell
+    _cell_paragraph_with_border(table.rows[2].cells[0], DIVIDER_BORDER_SPACE_BEFORE_PT, DIVIDER_BORDER_SPACE_AFTER_PT)
+    _cell_para(table.rows[2].cells[1], "")
+    # Row 3–5: plaintiff, -against-, defendant (left indent block, not center)
+    _cell_para(table.rows[3].cells[0], caption.get("plaintiff") or "", left_indent_inches=CAPTION_PARTY_LEFT_INDENT_INCHES)
+    _cell_para(table.rows[3].cells[1], "")
+    _cell_para(table.rows[4].cells[0], "-against-", left_indent_inches=CAPTION_PARTY_LEFT_INDENT_INCHES)
+    _cell_para(table.rows[4].cells[1], "")
+    _cell_para(table.rows[5].cells[0], caption.get("defendant") or "", left_indent_inches=CAPTION_PARTY_LEFT_INDENT_INCHES)
+    _cell_para(table.rows[5].cells[1], "")
+    # Row 6: second horizontal rule (border)
+    _cell_paragraph_with_border(table.rows[6].cells[0], DIVIDER_BORDER_SPACE_BEFORE_PT, DIVIDER_BORDER_SPACE_AFTER_PT)
+    _cell_para(table.rows[6].cells[1], "")
+
+    # Full-width divider below table: paragraph border + X aligned to right margin (tab stop)
+    p_after = doc.add_paragraph()
+    p_after.paragraph_format.space_before = Pt(DIVIDER_BORDER_SPACE_BEFORE_PT)
+    p_after.paragraph_format.space_after = Pt(SPACE_AFTER_CAPTION_PT)
+    try:
+        p_after.paragraph_format.tab_stops.add_tab_stop(Inches(6.5), WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.SPACES)
+    except Exception:
+        pass
+    p_after.add_run("\u00A0\tX")  # space for height + tab + X at right margin
+    _add_bottom_border_to_paragraph(p_after, pt=0.5, dashed=False)
+
+
+def _render_divider(doc, template_text: str, style: str, style_formatting: dict):
+    """Render divider as single paragraph with exact template text (never LLM-generated). Preserves template length/pattern."""
+    if not doc:
+        return
+    line = (template_text or "").strip() or "\u00A0"
+    p = doc.add_paragraph(line, style=style)
+    pf = (style_formatting.get(style) or {}).get("paragraph_format") or {}
+    _apply_paragraph_format(p, pf)
+
+
+def _render_signature_block(doc, lines: list[str], style: str, style_formatting: dict):
+    """Render signature block as atomic unit (attorney name, firm, title, address)."""
+    if not doc or not lines:
+        return
+    for text in lines:
+        if not (text or "").strip():
+            continue
+        p = doc.add_paragraph(text.strip(), style=style)
+        pf = (style_formatting.get(style) or {}).get("paragraph_format") or {}
+        _apply_paragraph_format(p, pf)
+
+
+def _apply_legal_body_format(paragraph):
+    """Explicit body formatting for legal pleadings: 1.5 line spacing, first-line indent, left align. Do not rely on template alone."""
+    if not paragraph:
+        return
+    try:
+        pf = paragraph.paragraph_format
+        pf.line_spacing_rule = WD_LINE_SPACING.MULTIPLE
+        pf.line_spacing = LEGAL_BODY_LINE_SPACING_MULTIPLE
+        pf.first_line_indent = Pt(LEGAL_BODY_FIRST_LINE_INDENT_PT)
+        pf.space_before = Pt(0)
+        pf.space_after = Pt(LEGAL_BODY_SPACE_AFTER_PT)
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    except Exception:
+        pass
+
+
+def _render_body_paragraph(doc, text: str, style: str, spec: dict, style_formatting: dict, bold_phrases_from_template, run_fmt_override=None, apply_legal_body_format: bool = True):
+    """Render one body paragraph. When apply_legal_body_format is True, explicitly set line spacing 1.5, first-line indent, left align."""
+    if not doc:
+        return
+    segments = parse_inline_formatting_markers(_render_checkboxes(text or ""))
+    segments = _apply_sample_bold_to_segments(segments, extra_bold_phrases=bold_phrases_from_template)
+    run_fmt = run_fmt_override or spec.get("run_format") or (style_formatting.get(style) or {}).get("run_format") or {}
+    p = doc.add_paragraph(style=style)
+    for seg in segments:
+        seg_text = seg[0]
+        bold, italic = seg[1], seg[2]
+        underline = seg[3] if len(seg) >= 4 else False
+        if not seg_text:
+            continue
+        run = p.add_run(seg_text)
+        fmt = dict(run_fmt)
+        if bold:
+            fmt["bold"] = True
+        if italic:
+            fmt["italic"] = True
+        if underline:
+            fmt["underline"] = True
+        _apply_run_format(run, fmt)
+    pf_spec = spec.get("paragraph_format") or (style_formatting.get(style) or {}).get("paragraph_format") or {}
+    _apply_paragraph_format(p, pf_spec)
+    if apply_legal_body_format:
+        _apply_legal_body_format(p)
+    else:
+        enforce_legal_alignment("paragraph", p)
+
+
+def _render_region_paragraphs(
+    doc,
+    text: str,
+    style_map: dict,
+    style_formatting: dict,
+    valid_style_names: set,
+    bold_phrases_from_template=None,
+    allow_dividers: bool = False,
+    split_single_newline: bool = False,
+    region_kind: str = "body",
+):
+    """
+    Render a region's text as paragraphs. region_kind: body/summons_intro/wherefore get explicit legal body format (1.5 spacing, indent, left).
+    signature gets left_indent; verification first line (ATTORNEY'S VERIFICATION) gets CENTER.
+    """
+    if not text or not (text or "").strip():
+        return
+    default_style = style_map.get("paragraph") or style_map.get("body") or (list(valid_style_names)[0] if valid_style_names else "Normal")
+    if default_style not in valid_style_names and valid_style_names:
+        default_style = list(valid_style_names)[0]
+    apply_legal_body = region_kind in ("body", "summons_intro", "wherefore")
+    if split_single_newline:
+        raw_lines = (text or "").strip().split("\n")
+        paragraphs_to_render = []
+        for line in raw_lines:
+            line = line.strip() if line else ""
+            if not allow_dividers and _is_dashed_line_only(line):
+                continue
+            if line:
+                paragraphs_to_render.append(line)
+    else:
+        blocks = re.split(r"\n\s*\n", text.strip())
+        paragraphs_to_render = []
+        for block in blocks:
+            block = block.strip() if block else ""
+            if not allow_dividers and _is_dashed_line_only(block):
+                continue
+            if block:
+                paragraphs_to_render.append(block)
+    for idx, para_text in enumerate(paragraphs_to_render):
+        if not para_text:
+            continue
+        spec = {"paragraph_format": (style_formatting.get(default_style) or {}).get("paragraph_format"), "run_format": (style_formatting.get(default_style) or {}).get("run_format")}
+        _render_body_paragraph(doc, para_text, default_style, spec or {}, style_formatting, bold_phrases_from_template or (), apply_legal_body_format=apply_legal_body)
+        p = doc.paragraphs[-1] if doc.paragraphs else None
+        if p:
+            if region_kind == "signature":
+                p.paragraph_format.left_indent = Pt(LEGAL_SIGNATURE_LEFT_INDENT_PT)
+                p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            elif region_kind == "verification" and idx == 0 and re.search(r"ATTORNEY'S VERIFICATION", para_text, re.I):
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+
+# Caption is layout-only: render by position (document_section), never by content match ("SUPERIOR COURT" in text).
+# When True, only the first caption (summons) is rendered at doc start; no caption tables mid-doc or in footer.
+RENDER_CAPTION_ONLY_AT_START = True
+
+
+def render_document_by_region(doc, regions: dict, caption_instances: list | None, schema: dict):
+    """
+    Region-aware layout: render in fixed order. Caption is position-based only (never triggered by content).
+    Exactly one layout caption at document start when RENDER_CAPTION_ONLY_AT_START else three (summons, complaint, footer).
+    """
+    _log_formatter.info("render_document_by_region: start")
+    style_map = schema.get("style_map") or {}
+    style_formatting = schema.get("style_formatting") or {}
+    valid_style_names = set(style_formatting.keys()) or {"Normal"}
+    bold_phrases = schema.get("bold_phrases_from_template") or []
+    caption_instances = caption_instances or []
+
+    # REGION 1: Summons caption (page top). Table-based (2x2 screenshot-accurate) or paragraph/tab or 7-row table.
+    _log_formatter.info("render_document_by_region: summons_caption")
+    summons_cap = next((c for c in caption_instances if c.get("type") == "summons_caption"), None)
+    if summons_cap and summons_cap.get("structured"):
+        if USE_TABLE_CAPTION_SCREENSHOT:
+            _render_caption_table_screenshot(doc, summons_cap["structured"], style_map, style_formatting, valid_style_names)
+        elif USE_PARAGRAPH_CAPTION:
+            _render_caption_geometry(doc, summons_cap["structured"], style_map, style_formatting, valid_style_names)
+        else:
+            _render_caption_table(doc, summons_cap["structured"], style_map, style_formatting, valid_style_names)
+
+    # Clean region text so embedded caption lines/blocks are never re-rendered as paragraphs (no reinjection).
+    def _cleaned(region_key: str) -> str:
+        return strip_embedded_caption_text(regions.get(region_key, "") or "")
+
+    # REGION 2: Summons intro — explicit body format (1.5 spacing, indent, left)
+    _log_formatter.info("render_document_by_region: summons_intro (cleaning)")
+    summons_intro_text = _cleaned("summons_intro")
+    _log_formatter.info("render_document_by_region: summons_intro (rendering)")
+    _render_region_paragraphs(
+        doc, summons_intro_text, style_map, style_formatting, valid_style_names,
+        bold_phrases, allow_dividers=False, region_kind="summons_intro",
+    )
+
+    # REGION 3: Complaint caption — only if we allow multiple caption positions (else skip; one caption at start only)
+    if not RENDER_CAPTION_ONLY_AT_START:
+        complaint_cap = next((c for c in caption_instances if c.get("type") == "complaint_caption"), None)
+        if complaint_cap and complaint_cap.get("structured"):
+            _render_caption_table(doc, complaint_cap["structured"], style_map, style_formatting, valid_style_names)
+
+    # REGION 4: Body — explicit legal body format (line spacing 1.5, first-line indent 36pt, left)
+    _log_formatter.info("render_document_by_region: body")
+    _render_region_paragraphs(
+        doc, _cleaned("body"), style_map, style_formatting, valid_style_names,
+        bold_phrases, allow_dividers=False, region_kind="body",
+    )
+
+    # REGION 5: Wherefore — explicit body format
+    _log_formatter.info("render_document_by_region: wherefore")
+    _render_region_paragraphs(
+        doc, _cleaned("wherefore"), style_map, style_formatting, valid_style_names,
+        bold_phrases, allow_dividers=False, region_kind="wherefore",
+    )
+
+    # REGION 6: Signature — left indent (3 in); one paragraph per line
+    _log_formatter.info("render_document_by_region: signature")
+    _render_region_paragraphs(
+        doc, _cleaned("signature"), style_map, style_formatting, valid_style_names,
+        bold_phrases, allow_dividers=False, split_single_newline=True, region_kind="signature",
+    )
+
+    # REGION 7: Verification — first line (ATTORNEY'S VERIFICATION) centered; one paragraph per line
+    _log_formatter.info("render_document_by_region: verification")
+    _render_region_paragraphs(
+        doc, _cleaned("verification"), style_map, style_formatting, valid_style_names,
+        bold_phrases, allow_dividers=False, split_single_newline=True, region_kind="verification",
+    )
+
+    # REGION 8: Footer caption — only if we allow multiple caption positions (else skip)
+    if not RENDER_CAPTION_ONLY_AT_START:
+        footer_cap = next((c for c in caption_instances if c.get("type") == "footer_caption"), None)
+        if footer_cap and footer_cap.get("structured"):
+            _render_caption_table(doc, footer_cap["structured"], style_map, style_formatting, valid_style_names)
+
+    # REGION 9: Footer text (dividers allowed only here if present in text)
+    _log_formatter.info("render_document_by_region: footer")
+    _render_region_paragraphs(
+        doc, _cleaned("footer"), style_map, style_formatting, valid_style_names,
+        bold_phrases, allow_dividers=True, region_kind="footer",
+    )
+    _log_formatter.info("render_document_by_region: done")
+
+
 # Numbered list (allegations): spacing and hanging indent for clean legal layout
 SPACE_BEFORE_NUMBERED_PT = 0.0
 SPACE_AFTER_NUMBERED_PT = 8.0   # space between each numbered point for readability
@@ -700,7 +1338,7 @@ NUMBERED_CLAIM_HEADING_STARTERS = (
     "the damages, and injuries sustained:",
 )
 
-# Phrases that are bold in the sample (NOTICE OF CLAIM, captions, verification, etc.). Applied to segments when no ** in input.
+# Phrases that are bold in the sample (NOTICE OF CLAIM, captions, verification, summons, etc.). Applied to segments when no ** in input.
 BOLD_IN_SAMPLE_PHRASES = (
     "NOTICE OF CLAIM",
     "PLEASE TAKE NOTICE",
@@ -715,6 +1353,9 @@ BOLD_IN_SAMPLE_PHRASES = (
     "The damages, and Injuries sustained",
     "4. The damages",
     "SEELIG DRESSLER OCHANI",
+    "complaint",
+    "TO THE ABOVE NAMED DEFENDANT",
+    "TO THE ABOVE-NAMED DEFENDANT",
 )
 
 
@@ -1061,7 +1702,7 @@ def _apply_default_body_indent(paragraph, style: str = None, style_formatting: d
 
 
 def _apply_default_line_spacing(paragraph, style: str = None, style_formatting: dict = None):
-    """Set line spacing only when the template/source did not set it (prefer source document)."""
+    """Set line spacing when template did not set it. Use MULTIPLE 1.5 for legal readability (not SINGLE 1.0)."""
     if not paragraph:
         return
     try:
@@ -1074,7 +1715,7 @@ def _apply_default_line_spacing(paragraph, style: str = None, style_formatting: 
         rule = getattr(pf, "line_spacing_rule", None)
         if current is None and rule is None:
             pf.line_spacing = DEFAULT_LINE_SPACING_MULTIPLE
-            pf.line_spacing_rule = WD_LINE_SPACING.SINGLE
+            pf.line_spacing_rule = WD_LINE_SPACING.MULTIPLE
     except Exception:
         pass
 
@@ -1199,13 +1840,14 @@ def _render_caption_blocks_into_cell(cell, blocks: list, style_map: dict, style_
             _apply_paragraph_format(sep, pf)
 
 
-def inject_blocks(doc, blocks, style_map=None, style_formatting=None, line_samples=None, section_heading_samples=None, template_structure=None, numbered_num_id=None, numbered_ilvl=0, bold_phrases_from_template=None, caption_table_layout=None):
+def inject_blocks(doc, blocks, style_map=None, style_formatting=None, line_samples=None, section_heading_samples=None, template_structure=None, numbered_num_id=None, numbered_ilvl=0, bold_phrases_from_template=None, caption_table_layout=None, caption_structured=None):
     """Inject text into template structure. When template_structure is provided (slot-fill):
     assign paragraph.style = template style only — no manual formatting. Word handles layout,
     numbering, spacing from style definitions. Renderer never invents formatting.
-    numbered_num_id/numbered_ilvl: when set, paragraphs with the numbered style get list numbering from the template (1., 2., 3. or a., b., etc.).
-    bold_phrases_from_template: phrases extracted from template bold runs; bold is applied to matching substrings in generated text.
-    caption_table_layout: when use_table is True, caption (left/right) is rendered in a 1x2 table instead of paragraphs."""
+    caption_structured: optional dict from deterministic parse (court, county, plaintiff, defendant, index_no, date_filed, divider_line). When set, caption slots are rendered via _render_caption_table() and LLM caption output is skipped.
+    numbered_num_id/numbered_ilvl: when set, paragraphs with the numbered style get list numbering from the template.
+    bold_phrases_from_template: phrases extracted from template bold runs.
+    caption_table_layout: when use_table is True, caption (left/right) is rendered in a 1x2 table instead of paragraphs (fallback path)."""
     if style_map is None:
         style_map = build_style_map_from_doc(doc)[0]
     if not style_map:
@@ -1216,9 +1858,10 @@ def inject_blocks(doc, blocks, style_map=None, style_formatting=None, line_sampl
     section_heading_samples = section_heading_samples or []
     valid_style_names = set(style_formatting.keys())
 
-    # Structure-driven slot-fill: parser only — assign existing text to slots; never invent or fallback.
+    # Structure-driven slot-fill: block-type specific rendering (caption table, divider, signature, body).
     if template_structure and len(blocks) == len(template_structure):
-        seen = set()  # Caption deduplication: do not render the same block text twice (stops repeated court headers)
+        seen = set()
+        caption_rendered = False
         for i in range(len(template_structure)):
             spec = template_structure[i]
             style = (blocks[i][0] if isinstance(blocks[i], (list, tuple)) else spec.get("style", "Normal"))
@@ -1229,24 +1872,22 @@ def inject_blocks(doc, blocks, style_map=None, style_formatting=None, line_sampl
             block_kind = spec.get("block_kind", "paragraph")
             section_type = spec.get("section_type", "body")
             template_text = (spec.get("template_text") or "").strip()
+
+            # Page break only from blueprint
             if spec.get("page_break_before"):
                 doc.add_page_break()
-            elif _looks_like_attorney_verification_heading(slot_text):
-                doc.add_page_break()
+
+            # Caption: render once from deterministic caption_structured (table) at first caption slot; skip all caption slots
+            if section_type == "caption":
+                if caption_structured and not caption_rendered:
+                    _render_caption_table(doc, caption_structured, style_map, style_formatting, valid_style_names)
+                    caption_rendered = True
+                continue
+
+            # Divider: preserve template line exactly (never LLM-generated)
             if block_kind == "line":
-                # Always render a line: use template_text when present, else add separator so line is not missing
-                if (slot_text or template_text).strip():
-                    if template_text:
-                        if _looks_like_caption_separator(template_text):
-                            _add_full_width_separator(doc, style=style, space_after_pt=SPACE_AFTER_CAPTION_PT, dashed=False)
-                        else:
-                            p = doc.add_paragraph(template_text, style=style)
-                            fmt = (style_formatting.get(style) or {}).get("paragraph_format") or {}
-                            _apply_paragraph_format(p, fmt)
-                            enforce_legal_alignment(_block_type_for_alignment(block_kind, section_type, style), p)
-                else:
-                    # Empty line slot (e.g. template had a graphic/border line): still render visible separator
-                    _add_full_width_separator(doc, style=style, space_after_pt=SPACE_AFTER_CAPTION_PT, dashed=False)
+                line_to_render = template_text or (line_samples[0] if line_samples else "") or DEFAULT_LINE
+                _render_divider(doc, line_to_render, style, style_formatting)
                 continue
             if block_kind == "section_underline":
                 p = doc.add_paragraph(style=style)
@@ -1255,62 +1896,20 @@ def inject_blocks(doc, blocks, style_map=None, style_formatting=None, line_sampl
                     _paragraph_border_bottom(p, pt=0.5)
                 else:
                     _add_bottom_border_to_paragraph(p, pt=0.5, dashed=False)
-                fmt = (style_formatting.get(style) or {}).get("paragraph_format") or {}
-                _apply_paragraph_format(p, fmt)
-                enforce_legal_alignment(_block_type_for_alignment(block_kind, section_type, style), p)
+                pf_spec = spec.get("paragraph_format") or (style_formatting.get(style) or {}).get("paragraph_format") or {}
+                _apply_paragraph_format(p, pf_spec)
                 continue
+            # Signature line: render template line exactly (atomic block)
             if block_kind == "signature_line":
-                if template_text:
-                    p = doc.add_paragraph(template_text, style=style)
-                    fmt = (style_formatting.get(style) or {}).get("paragraph_format") or {}
-                    _apply_paragraph_format(p, fmt)
-                    enforce_legal_alignment(_block_type_for_alignment(block_kind, section_type, style), p)
+                _render_divider(doc, template_text or slot_text or "\u2007", style, style_formatting)
                 continue
-            # Content slots: empty → skip; dedupe then render
+            # Content slots (body, heading, wherefore, verification, etc.): render as body paragraph with blueprint style
             if not slot_text:
                 continue
             if slot_text in seen:
                 continue
             seen.add(slot_text)
-            segments = parse_inline_formatting_markers(_render_checkboxes(slot_text))
-            segments = _apply_sample_bold_to_segments(segments, extra_bold_phrases=bold_phrases_from_template)
-            run_fmt = (style_formatting.get(style) or {}).get("run_format") or {}
-            p = doc.add_paragraph(style=style)
-            for seg in segments:
-                if len(seg) == 4:
-                    seg_text, bold, italic, underline = seg
-                else:
-                    seg_text, bold, italic = seg[0], seg[1], seg[2]
-                    underline = False
-                if not seg_text:
-                    continue
-                run = p.add_run(seg_text)
-                fmt = dict(run_fmt)
-                if bold:
-                    fmt["bold"] = True
-                if italic:
-                    fmt["italic"] = True
-                if underline:
-                    fmt["underline"] = True
-                _apply_run_format(run, fmt)
-            fmt = (style_formatting.get(style) or {}).get("paragraph_format") or {}
-            _apply_paragraph_format(p, fmt)
-            align_type = _block_type_for_alignment(block_kind, section_type, style)
-            enforce_legal_alignment(align_type, p)
-            if _should_align_right_caption(slot_text.strip()):
-                p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-            elif not _template_has_alignment(style, style_formatting) and _should_align_left_only(slot_text.strip()):
-                p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            if _looks_like_jurat_line(slot_text):
-                try:
-                    p.paragraph_format.keep_with_next = True
-                except Exception:
-                    pass
-            if _looks_like_list_intro(slot_text.strip()) or _looks_like_bullet_item(slot_text.strip()):
-                try:
-                    p.paragraph_format.keep_with_next = True
-                except Exception:
-                    pass
+            _render_body_paragraph(doc, slot_text, style, spec, style_formatting, bold_phrases_from_template or ())
         trim_trailing_separators(doc)
         return
 
@@ -1529,15 +2128,7 @@ def inject_blocks(doc, blocks, style_map=None, style_formatting=None, line_sampl
                 if align_type in ("paragraph", "numbered"):
                     _apply_default_line_spacing(p, style, style_formatting)
                 enforce_legal_alignment(align_type, p)
-                # Caption: left (court/parties), right (Index no., NOTICE OF MOTION), or center; TO:/address left
-                if _should_align_left_caption_block(txt_stripped):
-                    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                elif _should_align_right_caption(txt_stripped):
-                    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-                elif _should_align_center_caption(txt_stripped):
-                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                elif not _template_has_alignment(style, style_formatting) and _should_align_left_only(txt_stripped):
-                    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                # Blueprint-only: alignment from template (paragraph_format) already applied; do not override from content
                 if _looks_like_jurat_line(txt_stripped):
                     try:
                         p.paragraph_format.keep_with_next = True

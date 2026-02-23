@@ -417,12 +417,23 @@ def _call_openai(
         examples = [s.get("text", "")[:60] + ("..." if len(s.get("text", "")) > 60 else "") for s in line_samples[:5]]
         line_note = f"\nLine/separator samples (block_type 'line' or 'signature_line'): {examples}\n"
 
+    # When raw text is long, use a compact prompt so the full input fits in context and the model has room for a long output (no truncation)
+    raw_text_len = len(text or "")
+    raw_val = os.environ.get("FORMATTER_LLM_LONG_TEXT_CHARS", "28000")
+    long_text_threshold = int(raw_val) if (raw_val is not None and str(raw_val).strip() != "") else 28000
+    use_compact_prompt = raw_text_len > long_text_threshold
+    max_structure_items = 25 if use_compact_prompt else 80
+    max_content_items = 30 if use_compact_prompt else None
+    if use_compact_prompt and len(formatting_instructions) > 1500:
+        style_list = style_schema.get("paragraph_style_names", []) or list(style_schema.get("style_map", {}).values())
+        formatting_instructions = "Style names (use as block_type): " + ", ".join(style_list) + ". One block per paragraph/allegation; output the complete JSON array for the entire document including WHEREFORE, verification, certification, NOTICE OF ENTRY."
+
     # Section structure of the uploaded document: order and style per section (so LLM divides raw text accordingly)
     template_structure = style_schema.get("template_structure", [])
     section_structure_block = ""
     if template_structure:
         lines = []
-        for i, spec in enumerate(template_structure[:80]):  # cap to avoid huge prompt
+        for i, spec in enumerate(template_structure[:max_structure_items]):
             style_name = spec.get("style") or "Normal"
             section_type = spec.get("section_type") or "body"
             block_kind = spec.get("block_kind") or "paragraph"
@@ -439,6 +450,8 @@ def _call_openai(
 
     # Template content: how each paragraph was styled in the uploaded DOCX (so LLM can extract and apply formatting)
     template_content = style_schema.get("template_content", [])
+    if max_content_items is not None and template_content:
+        template_content = template_content[:max_content_items]
     template_section = ""
     if template_content:
         lines = []
@@ -448,8 +461,10 @@ def _call_openai(
             lines.append(f"[{style_name}]: {para_text}" if para_text else f"[{style_name}]:")
         template_section = "Template document (each paragraph with its style name):\n" + "\n".join(lines) + "\n\n"
 
-    # Optional: OCR text from template pages (Tesseract) for formatting/structure reference
+    # Optional: OCR text from template pages (Tesseract). When compact prompt, limit to first 2 pages to save context.
     ocr_texts = template_page_ocr_texts if template_page_ocr_texts is not None else (style_schema.get("template_page_ocr_texts") or [])
+    if use_compact_prompt and ocr_texts:
+        ocr_texts = ocr_texts[:2]
     ocr_block = ""
     if ocr_texts and any(t.strip() for t in ocr_texts):
         lines = [f"Page {i + 1} (OCR):\n{t}" for i, t in enumerate(ocr_texts) if t.strip()]
@@ -463,7 +478,7 @@ def _call_openai(
 
 ---
 
-Raw text to format. (1) Divide it into sections according to the uploaded document structure above. (2) Match each section with the styling and formatting of the uploaded document: assign the block_type (style name) that the template uses for that section. Use the same styles for titles, section headings, body paragraphs, and lists as in the template. For causes of action (e.g. negligence): output each allegation (each "That on...", "By reason of...", etc.) as a separate block with the template's list/numbered style; do not add "1." or "2." in the text—numbering is applied from the template. Insert page_break where the template starts a new section on a new page. Include every part of the raw text to the very end—do not stop after the first signature block; if WHEREFORE, verification, SUMMONS AND VERIFIED COMPLAINT, certification, or NOTICE OF ENTRY appear later in the raw text, output blocks for all of them. In the text field use ** for bold, * for italic, and __ for underline only where the template has selective emphasis (e.g. NOTICE OF CLAIM: bold title, party names, -Against-, PLEASE TAKE NOTICE, firm names, key terms like Personal Injury Action, dates/addresses when emphasized; italic only for "respondent"/"claimant" in parentheses; underline only when the template underlines a phrase). Do not bold/italic entire paragraphs or plain capitalized words. Output a JSON array of {{"block_type": "<style name or line/signature_line/page_break>", "text": "<content>"}}.
+Raw text to format (COMPLETE—process every section to the end). (1) Divide it into sections according to the uploaded document structure above. (2) Match each section with the styling and formatting of the uploaded document: assign the block_type (style name) that the template uses for that section. Use the same styles for titles, section headings, body paragraphs, and lists as in the template. For causes of action (e.g. negligence): output each allegation (each "That on...", "By reason of...", etc.) as a separate block with the template's list/numbered style; do not add "1." or "2." in the text—numbering is applied from the template. Insert page_break where the template starts a new section on a new page. Include every part of the raw text to the very end—do not stop after the first signature block; if WHEREFORE, verification, SUMMONS AND VERIFIED COMPLAINT, certification, NOTICE OF ENTRY, or NOTICE OF SETTLEMENT appear later, output blocks for all of them. In the text field use ** for bold, * for italic, and __ for underline only where the template has selective emphasis. Do not bold/italic entire paragraphs. Output a JSON array of {{"block_type": "<style name or line/signature_line/page_break>", "text": "<content>"}}. Do not truncate the array—emit a block for every segment to the end of the document.
 
 ---
 {text}
@@ -499,9 +514,10 @@ Raw text to format. (1) Divide it into sections according to the uploaded docume
             raise RuntimeError("Azure OpenAI requested but openai package may be too old. pip install openai>=1.0.0")
         client = AzureOpenAI(
             api_key=azure_key,
-            api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-15-preview"),
+            api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2024-12-01-preview"),
             azure_endpoint=azure_endpoint.rstrip("/"),
         )
+        # Azure: use AZURE_OPENAI_DEPLOYMENT (set this in .env to your deployment name, e.g. gpt-4o)
         model = os.environ.get("AZURE_OPENAI_DEPLOYMENT") or os.environ.get("FORMATTER_LLM_MODEL", "gpt-4o-mini")
     else:
         api_key = os.environ.get("OPENAI_API_KEY")
@@ -512,8 +528,9 @@ Raw text to format. (1) Divide it into sections according to the uploaded docume
         client = OpenAI(api_key=api_key)
         model = os.environ.get("FORMATTER_LLM_MODEL", "gpt-4o-mini")
 
-    # Default 16384 (many models' max). Set FORMATTER_LLM_MAX_TOKENS for models that allow more (e.g. 32768).
-    max_tokens = int(os.environ.get("FORMATTER_LLM_MAX_TOKENS", "16384"))
+    # Large default so long complaints (many allegations + WHEREFORE + verification) are not truncated. Set FORMATTER_LLM_MAX_TOKENS in .env (e.g. 131072) if needed.
+    raw_max = os.environ.get("FORMATTER_LLM_MAX_TOKENS", "16384")
+    max_completion_tokens = int(raw_max) if (raw_max is not None and str(raw_max).strip() != "") else 16384
     resp = client.chat.completions.create(
         model=model,
         messages=[
@@ -521,9 +538,15 @@ Raw text to format. (1) Divide it into sections according to the uploaded docume
             {"role": "user", "content": content},
         ],
         temperature=0.1,
-        max_tokens=max_tokens,
+        max_completion_tokens=max_completion_tokens,
     )
-    raw = resp.choices[0].message.content.strip()
+    choice = resp.choices[0] if resp.choices else None
+    if choice and getattr(choice, "finish_reason", None) == "length":
+        raise RuntimeError(
+            "LLM output was truncated (hit token limit). Set FORMATTER_LLM_MAX_TOKENS in .env to a higher value (e.g. 131072) and try again."
+        )
+    raw = (choice.message.content if choice and choice.message else "") or ""
+    raw = raw.strip()
     raw = _strip_llm_refusal_artifact(raw)
     # Strip markdown code fence if present
     if raw.startswith("```"):
@@ -661,9 +684,10 @@ Raw text:
             raise RuntimeError("Azure OpenAI requested but openai package may be too old. pip install openai>=1.0.0")
         client = AzureOpenAI(
             api_key=azure_key,
-            api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-15-preview"),
+            api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2024-12-01-preview"),
             azure_endpoint=azure_endpoint.rstrip("/"),
         )
+        # Azure: use AZURE_OPENAI_DEPLOYMENT (set in .env to your deployment, e.g. gpt-4o)
         model = os.environ.get("AZURE_OPENAI_DEPLOYMENT") or os.environ.get("FORMATTER_LLM_MODEL", "gpt-4o-mini")
     else:
         api_key = os.environ.get("OPENAI_API_KEY")
@@ -674,8 +698,8 @@ Raw text:
         client = OpenAI(api_key=api_key)
         model = os.environ.get("FORMATTER_LLM_MODEL", "gpt-4o-mini")
 
-    # Allow long output so slot-fill JSON is not truncated (model cap e.g. 16384)
-    max_tokens = 16384
+    # max_completion_tokens required by gpt-4o and newer models
+    max_completion_tokens = 16384
     resp = client.chat.completions.create(
         model=model,
         messages=[
@@ -683,7 +707,7 @@ Raw text:
             {"role": "user", "content": user_content},
         ],
         temperature=0.0,
-        max_tokens=max_tokens,
+        max_completion_tokens=max_completion_tokens,
     )
     raw = resp.choices[0].message.content.strip()
     if raw.startswith("```"):

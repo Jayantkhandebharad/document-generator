@@ -103,15 +103,20 @@ generated_text = st.text_area("Enter the generated text", height=300)
 
 if generated_text and template_file:
     if st.button("Format with LLM"):
+        import logging
+        log = logging.getLogger(__name__)
+        log.info("Format with LLM: button clicked, calling process_document")
         with st.spinner("Calling LLM and building document…"):
             try:
                 output_path, preview_text = process_document(generated_text, template_file)
+                log.info("Format with LLM: process_document returned successfully")
                 st.session_state["formatted_output_path"] = output_path
                 st.session_state["formatted_editor"] = preview_text
                 st.session_state["formatted_editor_html"] = plain_text_to_simple_html(preview_text)
                 st.session_state.pop("ckeditor_open_url", None)  # so user gets a fresh "Send to CKEditor" link
                 st.success("Document formatted successfully. Edit below with alignment and formatting, then download.")
             except Exception as e:
+                log.exception("Format with LLM: process_document failed")
                 st.error(str(e))
 
 if st.session_state.get("formatted_output_path") or st.session_state.get("formatted_editor_html"):
