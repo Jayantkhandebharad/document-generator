@@ -196,8 +196,12 @@ class FieldFetcher:
     Parses CURL, sends requests with retry, extracts answer text, and filters non-answers.
     """
 
-    def __init__(self):
-        pass
+    def __init__(self, llm_client=None):
+        if llm_client:
+            self._llm = llm_client
+        else:
+            from docgen.llm_client import LLMClient
+            self._llm = LLMClient()
 
     @staticmethod
     def _get_nested(data: Any, path: str) -> Any:
@@ -283,9 +287,7 @@ Response to classify:
 
 Reply with exactly one word: ANSWER or NON_ANSWER. No explanation."""
         try:
-            from docgen.llm_client import LLMClient
-            client = LLMClient()
-            reply = client.generate(prompt, max_tokens=10, temperature=0.0).strip().upper()
+            reply = self._llm.generate(prompt, max_tokens=10, temperature=0.0).strip().upper()
             if "NON_ANSWER" in reply:
                 return False
             if "ANSWER" in reply:

@@ -24,6 +24,12 @@ class Config:
         self._azure_api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview").strip()
         self._azure_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini").strip()
         self._use_azure_openai = bool(self._azure_endpoint and self._azure_api_key)
+        
+        self._gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        self._gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview").strip()
+        self._gemini_vertex_ai = os.getenv("GEMINI_VERTEX_AI", "true").lower() == "true"
+        self._gemini_thinking_level = os.getenv("GEMINI_THINKING_LEVEL", "HIGH").strip()
+        self._llm_provider = os.getenv("LLM_PROVIDER", "azure").strip().lower()
 
     def _load_env(self) -> None:
         try:
@@ -59,6 +65,26 @@ class Config:
     def USE_AZURE_OPENAI(self) -> bool:
         return self._use_azure_openai
 
+    @property
+    def GEMINI_API_KEY(self) -> str:
+        return self._gemini_api_key
+
+    @property
+    def GEMINI_MODEL(self) -> str:
+        return self._gemini_model
+        
+    @property
+    def GEMINI_VERTEX_AI(self) -> bool:
+        return self._gemini_vertex_ai
+
+    @property
+    def GEMINI_THINKING_LEVEL(self) -> str:
+        return self._gemini_thinking_level
+
+    @property
+    def LLM_PROVIDER(self) -> str:
+        return self._llm_provider
+
 
 # Singleton-like default instance for backward compatibility
 _default_config = Config()
@@ -69,3 +95,8 @@ AZURE_OPENAI_API_KEY = _default_config.AZURE_OPENAI_API_KEY
 AZURE_OPENAI_API_VERSION = _default_config.AZURE_OPENAI_API_VERSION
 AZURE_OPENAI_DEPLOYMENT = _default_config.AZURE_OPENAI_DEPLOYMENT
 USE_AZURE_OPENAI = _default_config.USE_AZURE_OPENAI
+GEMINI_API_KEY = _default_config.GEMINI_API_KEY
+GEMINI_MODEL = _default_config.GEMINI_MODEL
+GEMINI_VERTEX_AI = _default_config.GEMINI_VERTEX_AI
+GEMINI_THINKING_LEVEL = _default_config.GEMINI_THINKING_LEVEL
+LLM_PROVIDER = _default_config.LLM_PROVIDER

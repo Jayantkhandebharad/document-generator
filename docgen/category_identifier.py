@@ -6,8 +6,8 @@ from .llm_client import LLMClient
 
 
 class CategoryIdentifier:
-    def __init__(self):
-        self.llm = LLMClient()
+    def __init__(self, llm_client: LLMClient | None = None):
+        self.llm = llm_client or LLMClient()
     
     def identify_category(self, s1: str, s2: str) -> str:
         prompt = f"""Identify the category of the document based on the following text:

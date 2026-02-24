@@ -58,11 +58,25 @@ from docgen.question_generator import QuestionGenerator
 from docgen.section_generator import SectionGenerator
 from docgen.assembler import Assembler
 from docgen.category_identifier import CategoryIdentifier
+from docgen.llm_client import LLMClient
 
 # -------------------------
 # Sidebar
 # -------------------------
 with st.sidebar:
+    st.header("Configuration")
+    llm_provider = st.radio(
+        "LLM Provider", 
+        ["Azure", "Gemini"], 
+        index=0 if os.getenv("LLM_PROVIDER", "azure").lower() == "azure" else 1
+    )
+    os.environ["LLM_PROVIDER"] = llm_provider.lower()
+    
+    if llm_provider == "Gemini":
+        st.caption("Using Gemini 3.1 Pro (Preview) with Thinking")
+        
+    st.divider()
+
     st.header("Inputs")
     sample1 = st.file_uploader("Sample document 1", type=["txt", "docx"])
     sample2 = st.file_uploader("Sample document 2", type=["txt", "docx"])
@@ -106,6 +120,8 @@ st.markdown(
 # Pipeline
 # -------------------------
 def run_pipeline():
+    llm_client = LLMClient(provider=os.getenv("LLM_PROVIDER", "azure"))
+    question_generator = QuestionGenerator(llm_client=llm_client)
     if not sample1 or not sample2:
         st.error("Upload both sample documents.")
         return
@@ -123,7 +139,9 @@ def run_pipeline():
     with open("sample1.txt", "wb") as f:
         f.write(str(s1).encode("utf-8"))
 
-    category_of_document = CategoryIdentifier().identify_category(s1, s2)
+    category_of_document = CategoryIdentifier(llm_client=llm_client).identify_category(s1, s2)
+    print("category_of_document",category_of_document)
+    print(question_generator.generate_questions_for_fields(["plaintiff_name","defendent_name"],category_of_document))
     with open("category_of_document.txt", "wb") as f:
         f.write(str(category_of_document).encode("utf-8"))
 
@@ -134,12 +152,12 @@ def run_pipeline():
     ctx = (extra_context or "").strip()
 
     # OOP: docgen pipeline components
-    sectioner = Sectioner()
-    extractor = Extractor()
-    section_prompt_generator = SectionPromptGenerator()
-    field_fetcher = FieldFetcher()
-    question_generator = QuestionGenerator()
-    section_generator = SectionGenerator()
+    sectioner = Sectioner(llm_client=llm_client)
+    extractor = Extractor(llm_client=llm_client)
+    section_prompt_generator = SectionPromptGenerator(llm_client=llm_client)
+    field_fetcher = FieldFetcher(llm_client=llm_client)
+    
+    section_generator = SectionGenerator(llm_client=llm_client)
     assembler = Assembler()
 
     # =====================================================
@@ -235,8 +253,9 @@ def run_pipeline():
     if (curl_input or "").strip():
         st.subheader("Step 3: Fetching data via API")
         if all_required:
+            print("all_required",all_required)
             with st.status("Generating questions for each field...", state="running"):
-                field_to_question = question_generator.generate_questions_for_fields(all_required)
+                field_to_question = question_generator.generate_questions_for_fields(all_required,category_of_document)
             generated_questions_file = "generated_questions.json"
             with open(generated_questions_file, "wb") as f:
                 f.write(json.dumps(field_to_question).encode("utf-8"))

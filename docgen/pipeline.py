@@ -78,7 +78,7 @@ class Pipeline:
         auth_str = (curl_str or "").strip()
         if auth_str:
             if all_required:
-                field_to_question = self._question_generator.generate_questions_for_fields(all_required)
+                field_to_question = self._question_generator.generate_questions_for_fields(all_required, category_of_document)
                 field_values = self._field_fetcher.fetch_all_fields_via_chat(
                     auth_str, all_required, field_to_question
                 )
