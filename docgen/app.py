@@ -80,7 +80,8 @@ with st.sidebar:
     st.header("Inputs")
     sample1 = st.file_uploader("Sample document 1", type=["txt", "docx"])
     sample2 = st.file_uploader("Sample document 2", type=["txt", "docx"])
-    curl_input = st.text_area("CURL command", height=120)
+    curl_input = st.text_area("Case ID or CURL command", height=120)
+    firm_id_input = st.number_input("Firm ID (for Case Search)", value=1680, step=1)
     extra_context = st.text_area("Extra context (optional)", height=100)
 
 # -------------------------
@@ -122,6 +123,8 @@ st.markdown(
 def run_pipeline():
     llm_client = LLMClient(provider=os.getenv("LLM_PROVIDER", "azure"))
     question_generator = QuestionGenerator(llm_client=llm_client)
+    
+    # --- TRIAL USAGE END ---
     if not sample1 or not sample2:
         st.error("Upload both sample documents.")
         return
@@ -140,8 +143,7 @@ def run_pipeline():
         f.write(str(s1).encode("utf-8"))
 
     category_of_document = CategoryIdentifier(llm_client=llm_client).identify_category(s1, s2)
-    print("category_of_document",category_of_document)
-    print(question_generator.generate_questions_for_fields(["plaintiff_name","defendent_name"],category_of_document))
+    
     with open("category_of_document.txt", "wb") as f:
         f.write(str(category_of_document).encode("utf-8"))
 
@@ -250,7 +252,40 @@ def run_pipeline():
                 all_required.append(f)
 
     field_values = {}
-    if (curl_input or "").strip():
+    
+    # Check if input is a digit (Case ID) or CURL command
+    curl_input_clean = (curl_input or "").strip()
+    is_case_id = curl_input_clean.isdigit()
+    
+    if is_case_id:
+        # Case 1: Case ID Search
+        st.subheader("Step 3: Fetching data from Case Search")
+        if all_required:
+            status_placeholder = st.empty()
+            progress = st.progress(0, text="Searching documents...")
+            
+            def on_doc_progress(doc_name: str, index: int, total: int):
+                status_placeholder.markdown(f"**Scanning document {index}/{total}:** `{doc_name}`")
+                progress.progress(index / total, text=f"Scanning: {doc_name} ({index}/{total})")
+            
+            # Fetch using the new search strategy
+            field_values = field_fetcher.fetch_fields_from_case_search(
+                case_id=curl_input_clean,
+                firm_id=firm_id_input,
+                required_fields=all_required,
+                on_doc_start=on_doc_progress
+            )
+            
+            status_placeholder.markdown(f"**Done.** Found {len(field_values)} of {len(all_required)} fields.")
+            progress.progress(1.0, text="Done.")
+            
+        with st.expander("Field → value (from Search)", expanded=True):
+             for f, v in field_values.items():
+                vstr = str(v)
+                st.markdown(f"**{f}** → {vstr[:200] + '...' if len(vstr) > 200 else vstr}")
+
+    elif curl_input_clean:
+        # Case 2: CURL Command (Legacy Chat API)
         st.subheader("Step 3: Fetching data via API")
         if all_required:
             print("all_required",all_required)

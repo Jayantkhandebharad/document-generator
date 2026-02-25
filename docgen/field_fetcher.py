@@ -15,6 +15,13 @@ from typing import Any, Callable
 OnFieldStartCallback = Callable[[str, int, int], None]
 
 try:
+    from azure.core.credentials import AzureKeyCredential
+    from azure.search.documents import SearchClient
+    HAS_AZURE_SEARCH = True
+except ImportError:
+    HAS_AZURE_SEARCH = False
+
+try:
     import requests
     HAS_REQUESTS = True
 except ImportError:
@@ -507,6 +514,306 @@ Reply with exactly one word: ANSWER or NON_ANSWER. No explanation."""
                 self._human_delay(min_delay, max_delay)
         return result
 
+    def _extract_fields_from_chunk(self, chunk: str, missing_fields: set[str]) -> dict[str, dict]:
+        """
+        Helper method to call LLM for a single chunk.
+        Returns a dict of found fields: { "field_name": { "value": "...", "confidence": "HIGH"/"LOW" } }
+        """
+        # Sort fields to ensure deterministic prompt
+        current_fields = sorted(missing_fields)
+        
+        # Batching logic
+        if len(current_fields) > 50:
+             field_batches = [current_fields[j:j+50] for j in range(0, len(current_fields), 50)]
+        else:
+             field_batches = [current_fields]
+
+        results = {}
+
+        for batch in field_batches:
+            # print(f"[FieldFetcher]     - Searching for {len(batch)} fields: {batch}")
+            
+            fields_list_str = ', '.join(batch)
+            
+            # Construct prompt asking for specific fields and confidence scores
+            prompt = f"""You are extracting data for a legal case from a document chunk.
+Target Fields: {fields_list_str}
+
+Chunk Content:
+\"\"\"
+{chunk}
+\"\"\"
+
+INSTRUCTIONS:
+1. Extract values for the target fields ONLY if present in the text.
+2. For each extracted value, assign a CONFIDENCE score:
+   - "HIGH": Explicitly stated, unambiguous.
+   - "LOW": Inferred, ambiguous, or partial match.
+3. Return a JSON object with a single key "items", containing a list of objects.
+   - Format: {{ "items": [ {{ "field": "FIELD_NAME", "value": "EXTRACTED_VALUE", "confidence": "HIGH"|"LOW" }}, ... ] }}
+4. Omit fields not found.
+
+Example:
+{{
+  "items": [
+    {{ "field": "plaintiff_name", "value": "John Doe", "confidence": "HIGH" }},
+    {{ "field": "incident_date", "value": "2023-01-01", "confidence": "LOW" }}
+  ]
+}}
+"""
+            # Define Schema for structured output
+            schema = {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "field": {"type": "string"},
+                                "value": {"type": "string"},
+                                "confidence": {"type": "string", "enum": ["HIGH", "LOW"]}
+                            },
+                            "required": ["field", "value", "confidence"],
+                            "additionalProperties": False
+                        }
+                    }
+                },
+                "required": ["items"],
+                "additionalProperties": False
+            }
+
+            try:
+                # Call LLM with schema
+                raw_resp = self._llm.generate(prompt, json_mode=True, max_tokens=1000, response_schema=schema)
+                
+                # Parse JSON safely
+                clean_resp = raw_resp.strip()
+                if "```json" in clean_resp:
+                    clean_resp = clean_resp.split("```json")[1].split("```")[0]
+                elif "```" in clean_resp:
+                    clean_resp = clean_resp.split("```")[1].split("```")[0]
+                    
+                data = json.loads(clean_resp)
+                
+                if not data:
+                    continue
+
+                items_list = []
+                # Normalize data to list of items
+                if isinstance(data, dict):
+                    if "items" in data and isinstance(data["items"], list):
+                         items_list = data["items"]
+                    else:
+                        # Fallback for old dict format or mismatched schema result
+                        for k, v in data.items():
+                             if k == "items": continue
+                             if isinstance(v, dict):
+                                items_list.append({"field": k, "value": v.get("value"), "confidence": v.get("confidence")})
+                             else:
+                                items_list.append({"field": k, "value": v, "confidence": "LOW"})
+                elif isinstance(data, list):
+                     items_list = data
+                
+                # Process results
+                for item in items_list:
+                    if not isinstance(item, dict):
+                        continue
+                        
+                    field = item.get("field")
+                    val = str(item.get("value", "")).strip()
+                    conf = str(item.get("confidence", "LOW")).upper()
+                    
+                    if not field or not val or val.lower() in ("null", "none", "n/a"):
+                        continue
+                        
+                    results[field] = {"value": val, "confidence": conf}
+
+            except json.JSONDecodeError:
+                print(f"[FieldFetcher]     - Error: LLM returned invalid JSON. Response: {raw_resp[:200]}...")
+                # Try to salvage partial valid JSON if it's just extra text
+                try:
+                    # Sometimes LLMs add text after the JSON
+                    match = re.search(r'(\{.*"items":\s*\[.*\]\})', clean_resp, re.DOTALL)
+                    if match:
+                        data = json.loads(match.group(1))
+                        # Process results logic (duplicated from above for robustness)
+                        items_list = []
+                        if isinstance(data, dict):
+                            if "items" in data and isinstance(data["items"], list):
+                                items_list = data["items"]
+                        for item in items_list:
+                            if not isinstance(item, dict): continue
+                            field = item.get("field")
+                            val = str(item.get("value", "")).strip()
+                            conf = str(item.get("confidence", "LOW")).upper()
+                            if not field or not val or val.lower() in ("null", "none", "n/a"): continue
+                            results[field] = {"value": val, "confidence": conf}
+                except:
+                    pass
+            except Exception as e:
+                print(f"[FieldFetcher]     - Error processing chunk: {e}")
+        
+        return results
+
+    def fetch_fields_from_case_search(
+        self,
+        case_id: str | int,
+        required_fields: list[str],
+        firm_id: str | int = 1,
+        on_doc_start: Callable[[str, int, int], None] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Fetch field values by searching documents in Azure Search for the given case_id.
+        Iteratively processes documents to find missing fields.
+        Uses DocumentFetcher to handle Azure Search and temp file storage.
+        """
+        from docgen.document_fetcher import DocumentFetcher
+
+        print(f"\n[FieldFetcher] Starting search for case_id={case_id} (firm_id={firm_id})")
+        print(f"[FieldFetcher] Required fields: {required_fields}")
+
+        missing_fields = set(required_fields)
+        found_values = {}
+        confused_values = {} 
+
+        # Using DocumentFetcher as a context manager ensures automatic cleanup of temp files
+        with DocumentFetcher() as fetcher:
+            # Fetch and store documents internally
+            count = fetcher.fetch_documents(case_id, firm_id)
+            
+            if count == 0:
+                print("[FieldFetcher] No documents returned from search.")
+                return {}
+
+            # Iterate through documents one by one
+            for doc in fetcher.iter_documents():
+                if not missing_fields:
+                    print("[FieldFetcher] All fields found. Stopping document processing.")
+                    break
+                    
+                doc_name = doc["name"]
+                doc_content = doc["content"]
+                idx = doc["index"]
+                total = doc["total"]
+                
+                if on_doc_start:
+                    on_doc_start(doc_name, idx, total)
+                
+                print(f"[FieldFetcher] Processing document {idx}/{total}: {doc_name} ({len(doc_content)} chars)")
+                
+                # Split content
+                chunks = self._split_text(doc_content)
+                print(f"[FieldFetcher]   - Document split into {len(chunks)} chunks for LLM processing.")
+                
+                # Free doc_content from memory immediately as chunks are created
+                del doc_content
+                
+                for c_idx, chunk in enumerate(chunks):
+                    if not missing_fields:
+                        break
+                    
+                    # Call helper to process chunk
+                    chunk_results = self._extract_fields_from_chunk(chunk, missing_fields)
+                    
+                    found_in_chunk = 0
+                    for field, res in chunk_results.items():
+                        if field not in missing_fields:
+                            continue
+
+                        val = res["value"]
+                        conf = res["confidence"]
+                        
+                        found_in_chunk += 1
+                        print(f"[FieldFetcher]       + Found '{field}': '{val}' (Confidence: {conf})")
+
+                        if conf == "HIGH":
+                            found_values[field] = val
+                            missing_fields.remove(field)
+                            print(f"[FieldFetcher]       >>> CONFIDENTLY FOUND '{field}': '{val}' (Removed from search)")
+                            if field in confused_values:
+                                del confused_values[field]
+                        else:
+                            # Store LOW confidence value only if we don't have one yet
+                            if field not in confused_values:
+                                confused_values[field] = val
+                    
+                    if found_in_chunk == 0:
+                        print(f"[FieldFetcher]     - No target fields found in chunk {c_idx+1}.")
+        
+        # Final merge: use confused values for anything not found with HIGH confidence
+        for k, v in confused_values.items():
+            if k not in found_values:
+                found_values[k] = v
+                print(f"[FieldFetcher] Using LOW confidence value for '{k}': '{v}'")
+        
+        print(f"[FieldFetcher] Search complete. Found {len(found_values)}/{len(required_fields)} fields.")
+        return found_values
+
+    @staticmethod
+    def _split_text(text: str, chunk_size=35000, chunk_overlap=400) -> list[str]:
+        if not text:
+            return []
+        try:
+            chunks = []
+            start = 0
+            print(f"[FieldFetcher] Splitting text into chunks of size {chunk_size} with overlap {chunk_overlap}")
+            text_len = len(text)
+            
+            # Safety check
+            if chunk_overlap >= chunk_size:
+                print(f"[FieldFetcher] Adjusting overlap from {chunk_overlap} to {int(chunk_size * 0.1)} because it >= chunk_size")
+                chunk_overlap = max(0, int(chunk_size * 0.1))
+
+            while start < text_len:
+                end = min(start + chunk_size, text_len)
+                # print(f"[FieldFetcher] DEBUG: start={start}, end={end}, text_len={text_len}")
+                
+                if end < text_len:
+                    # Try to split at newline
+                    last_newline = text.rfind("\n", start, end)
+                    if last_newline != -1 and last_newline > start + chunk_size - chunk_overlap:
+                        end = last_newline + 1
+                    else:
+                        last_space = text.rfind(" ", start, end)
+                        if last_space != -1 and last_space > start + chunk_size - chunk_overlap:
+                            end = last_space + 1
+                
+                # Infinite loop protection
+                if end <= start:
+                    print(f"[FieldFetcher] ERROR: Infinite loop detected. start={start}, end={end}, chunk_size={chunk_size}")
+                    end = min(start + chunk_size, text_len)
+                    if end <= start:
+                        print(f"[FieldFetcher] CRITICAL: Cannot advance. Breaking.")
+                        break
+
+                chunks.append(text[start:end])
+                
+                # If we reached the end of the text, stop.
+                # Otherwise, the overlap backtracking will cause us to emit 
+                # hundreds of redundant tiny chunks at the tail end.
+                if end == text_len:
+                    break
+
+                new_start = end - chunk_overlap
+                
+                # Ensure we move forward
+                if new_start <= start:
+                     # print(f"[FieldFetcher] DEBUG: Overlap prevents forward movement. Forcing advance.")
+                     new_start = start + 1
+                
+                start = new_start
+            
+            print(f"[FieldFetcher] Split text into {len(chunks)} chunks")
+            return chunks
+            
+        except Exception as e:
+            print(f"[FieldFetcher] Error splitting text: {e}")
+            import traceback
+            traceback.print_exc()
+            # Fallback to returning the whole text as one chunk to avoid losing data
+            return [text]
+
 
 def _default_question_for_field(field_name: str) -> str:
     from docgen.question_generator import _fallback_question
@@ -596,3 +903,17 @@ def fetch_broad_answers(
     on_question_start: Callable[[str, int, int], None] | None = None,
 ) -> dict[str, str]:
     return FieldFetcher().fetch_broad_answers(curl_str, delay_seconds, on_question_start)
+
+
+def fetch_fields_from_case_search(
+    case_id: str | int,
+    required_fields: list[str],
+    firm_id: str | int = 1,
+    on_doc_start: Callable[[str, int, int], None] | None = None,
+) -> dict[str, Any]:
+    return FieldFetcher().fetch_fields_from_case_search(
+        case_id=case_id, 
+        required_fields=required_fields, 
+        firm_id=firm_id, 
+        on_doc_start=on_doc_start
+    )

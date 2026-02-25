@@ -31,6 +31,10 @@ class Config:
         self._gemini_thinking_level = os.getenv("GEMINI_THINKING_LEVEL", "HIGH").strip()
         self._llm_provider = os.getenv("LLM_PROVIDER", "azure").strip().lower()
 
+        self._azure_search_endpoint = os.getenv("AZURE_SEARCH_ENDPOINT", "").strip()
+        self._azure_search_key = os.getenv("AZURE_SEARCH_KEY", "").strip()
+        self._azure_search_index = os.getenv("AZURE_SEARCH_INDEX", "clx-chat-with-case-01").strip()
+
     def _load_env(self) -> None:
         try:
             from dotenv import load_dotenv
@@ -85,6 +89,18 @@ class Config:
     def LLM_PROVIDER(self) -> str:
         return self._llm_provider
 
+    @property
+    def AZURE_SEARCH_ENDPOINT(self) -> str:
+        return self._azure_search_endpoint
+
+    @property
+    def AZURE_SEARCH_KEY(self) -> str:
+        return self._azure_search_key
+
+    @property
+    def AZURE_SEARCH_INDEX(self) -> str:
+        return self._azure_search_index
+
 
 # Singleton-like default instance for backward compatibility
 _default_config = Config()
@@ -100,3 +116,6 @@ GEMINI_MODEL = _default_config.GEMINI_MODEL
 GEMINI_VERTEX_AI = _default_config.GEMINI_VERTEX_AI
 GEMINI_THINKING_LEVEL = _default_config.GEMINI_THINKING_LEVEL
 LLM_PROVIDER = _default_config.LLM_PROVIDER
+AZURE_SEARCH_ENDPOINT = _default_config.AZURE_SEARCH_ENDPOINT
+AZURE_SEARCH_KEY = _default_config.AZURE_SEARCH_KEY
+AZURE_SEARCH_INDEX = _default_config.AZURE_SEARCH_INDEX
