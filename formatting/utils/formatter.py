@@ -614,8 +614,14 @@ def _is_separator_noise(text: str) -> bool:
         return True
     return False
 
-# Phrases that start the main body (after caption); caption = everything before this
+# Phrases that start the main body (after caption); caption = everything before this.
+# Caption table should contain ONLY: court, parties, index no, date filed, document title, jury demand.
+# Summons body text, "TO THE ABOVE NAMED DEFENDANT", and "The basis of venue" must be outside the table.
 BODY_START_PHRASES = (
+    "you are hereby summoned",
+    "to the above named defendant",
+    "the above named defendant",
+    "the basis of venue",
     "please take notice",
     "take further notice",
     "dated:",
@@ -624,15 +630,19 @@ BODY_START_PHRASES = (
     "being duly sworn",
     "duly sworn, says",
 )
-# Right-column caption: index number and motion/document title (placed right-aligned, index on same line as plaintiff when merged)
+# Right-column caption: index number, date filed, document title, jury demand (right-aligned)
 RIGHT_CAPTION_PHRASES = (
     "index no",
     "index number",
+    "date filed",
+    "summons",
+    "jury trial demanded",
     "notice of motion",
     "to restore",
     "affirmation in support",
     "affidavit of service",
     "memorandum of law",
+    "verified complaint",
 )
 # Tab position for right-aligned caption (index no., doc title): ~6" from left for standard margins
 RIGHT_CAPTION_TAB_POSITION_PT = 432.0
@@ -1129,6 +1139,18 @@ def _split_caption_body(blocks: list) -> tuple[list, list, list]:
             right.append(b)
         else:
             left.append(b)
+    # Order right column: Index No, Date Filed, document title (SUMMONS etc.), Jury Trial Demanded
+    def _right_col_order(item):
+        _, text = item
+        t = (text or "").strip().lower()
+        if "index no" in t or "index number" in t:
+            return 0
+        if "date filed" in t:
+            return 1
+        if "jury trial" in t:
+            return 3
+        return 2  # summons, verified complaint, notice of motion, etc.
+    right.sort(key=_right_col_order)
     return left, right, body_blocks
 
 
