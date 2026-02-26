@@ -79,7 +79,7 @@ def file_to_text(data: bytes, filename: str) -> str:
         with tempfile.TemporaryDirectory() as tmpdir:
 
             # Save uploaded file
-            input_path = Path(tmpdir) / "input.docx"
+            input_path = Path(tmpdir)/ "input.docx"
 
             with open(input_path, "wb") as f:
                 f.write(data)
@@ -87,7 +87,7 @@ def file_to_text(data: bytes, filename: str) -> str:
             # Convert to HTML using LibreOffice
             subprocess.run(
                 [
-                    SOFFICE_PATH,   # 👈 Full path here
+                    SOFFICE_PATH,   
                     "--headless",
                     "--convert-to",
                     "html",
@@ -124,44 +124,51 @@ def file_to_text(data: bytes, filename: str) -> str:
     return data.decode("utf-8", errors="ignore")
 
 
+def _plain_text_to_docx_bytes(text: str) -> bytes:
+    """Build a .docx from plain text (one paragraph per block). No LibreOffice."""
+    from docx import Document
+    doc = Document()
+    for block in (text or "").split("\n\n"):
+        block = block.strip()
+        if block:
+            doc.add_paragraph(block.replace("\n", " "))
+    buf = BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf.read()
+
+
 def text_to_docx_bytes(text: str) -> bytes:
     """
-    Convert structured text → HTML → DOCX using LibreOffice.
-    Preserves numbering and lists.
+    Convert structured text → DOCX. Tries LibreOffice (HTML→DOCX) first for list numbering;
+    on failure falls back to python-docx (plain paragraphs).
     """
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-
-        tmpdir = Path(tmpdir)
-
-        html_path = tmpdir / "input.html"
-        docx_path = tmpdir / "input.docx"
-
-        # Step 1: Convert text → basic HTML
-        html = build_html_from_text(text)
-
-        html_path.write_text(html, encoding="utf-8")
-
-        # Step 2: Convert HTML → DOCX
-        subprocess.run(
-            [
-                SOFFICE_PATH,
-                "--headless",
-                "--convert-to",
-                "docx",
-                "--outdir",
-                str(tmpdir),
-                str(html_path),
-            ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-        if not docx_path.exists():
-            raise RuntimeError("HTML → DOCX conversion failed")
-
-        return docx_path.read_bytes()
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            html_path = tmpdir / "input.html"
+            docx_path = tmpdir / "input.docx"
+            html = build_html_from_text(text)
+            html_path.write_text(html, encoding="utf-8")
+            result = subprocess.run(
+                [
+                    SOFFICE_PATH,
+                    "--headless",
+                    "--convert-to",
+                    "docx",
+                    "--outdir",
+                    str(tmpdir),
+                    str(html_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if result.returncode != 0 or not docx_path.exists():
+                raise RuntimeError(result.stderr or "HTML → DOCX conversion failed")
+            return docx_path.read_bytes()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError, FileNotFoundError, OSError):
+        return _plain_text_to_docx_bytes(text)
 
 def build_html_from_text(text: str) -> str:
     """Build minimal HTML from plain text, preserving numbered lines as <ol>/<li>."""
@@ -199,7 +206,7 @@ from docgen.field_fetcher import FieldFetcher, _default_question_for_field
 from docgen.question_generator import QuestionGenerator
 from docgen.section_generator import SectionGenerator
 from docgen.assembler import Assembler
-from docgen.utils import fill_placeholders_from_context_with_llm
+from docgen.utils import fill_placeholders_from_context_with_llm, fill_placeholders_from_field_values
 
 # -------------------------
 # Sidebar
@@ -333,23 +340,39 @@ def run_pipeline():
 
     st.success("Extraction and prompts ready.")
 
-    # Arbitrators: one for all extracted text, one for all prompts (default closed)
-    with st.expander("**Extracted text (all sections)**", expanded=False):
+    with st.expander("View extracted sample text for each section (how extraction worked)"):
         for i, sec in enumerate(sections):
-            st.markdown(f"### {sec['name']}")
-            st.markdown(
-                f"<div class='muted-box'>{extracted[i]}</div>",
-                unsafe_allow_html=True,
-            )
-            st.markdown("")
-    with st.expander("**Prompts (all sections)**", expanded=False):
+            sample_text = extracted[i] if i < len(extracted) else ""
+            with st.expander(f"{i + 1}. {sec['name']} — {len(sample_text)} chars"):
+                if sample_text:
+                    st.text_area(
+                        "Extracted text",
+                        value=sample_text,
+                        height=min(400, max(120, 80 + sample_text.count("\n") * 18)),
+                        key=f"extracted_sample_{i}",
+                        disabled=True,
+                        label_visibility="collapsed",
+                    )
+                else:
+                    st.info("No text extracted for this section.")
+    with st.expander("View prompt and required fields for each section"):
         for i, sec in enumerate(sections):
+            info = prompts[i] if i < len(prompts) else {}
             st.markdown(f"### {sec['name']}")
-            st.markdown(
-                f"<div class='muted-box'>{prompts[i]['prompt']}</div>",
-                unsafe_allow_html=True,
-            )
-            st.markdown("")
+            st.caption("Required fields: " + ", ".join(info.get("required_fields", [])))
+            prompt_text = info.get("prompt", "")
+            if prompt_text:
+                st.text_area(
+                    "Prompt",
+                    value=prompt_text,
+                    height=min(400, max(120, 80 + prompt_text.count("\n") * 18)),
+                    key=f"section_prompt_{i}",
+                    disabled=True,
+                    label_visibility="collapsed",
+                )
+            else:
+                st.info("No prompt for this section.")
+
 
     # =====================================================
     # STEP 3 — Fetch field values via API
@@ -507,6 +530,8 @@ def run_pipeline():
     final_draft = assembler.assemble(blueprint, draft_sections)
     # Use LLM to fill [placeholders] from case summary / field context; fallback to key lookup if LLM fails
     final_draft = fill_placeholders_from_context_with_llm(final_draft, field_values)
+    # Second pass: fill any remaining placeholders from obtained field values and case summary (key lookup)
+    final_draft = fill_placeholders_from_field_values(final_draft, field_values)
     formatted_docx_bytes = None
     formatting_error = None
 
@@ -656,24 +681,39 @@ def render_saved_pipeline_results():
 
     # Step 2
     st.subheader("Step 2 · Analyzing sample documents")
-    with st.expander("**Extracted text (all sections)**", expanded=False):
+    with st.expander("View extracted sample text for each section (how extraction worked)"):
+        st.caption("Section text was extracted in chunks (a few sections per call) so the full document content is used and nothing is truncated.")
         for i, sec in enumerate(sections):
-            st.markdown(f"### {sec['name']}")
-            if i < len(extracted):
-                st.markdown(
-                    f"<div class='muted-box'>{extracted[i]}</div>",
-                    unsafe_allow_html=True,
-                )
-            st.markdown("")
-    with st.expander("**Prompts (all sections)**", expanded=False):
+            sample_text = extracted[i] if i < len(extracted) else ""
+            with st.expander(f"{i + 1}. {sec['name']} — {len(sample_text)} chars"):
+                if sample_text:
+                    st.text_area(
+                        "Extracted text",
+                        value=sample_text,
+                        height=min(400, max(120, 80 + sample_text.count("\n") * 18)),
+                        key=f"saved_extracted_{i}",
+                        disabled=True,
+                        label_visibility="collapsed",
+                    )
+                else:
+                    st.info("No text extracted for this section.")
+    with st.expander("View prompt and required fields for each section"):
         for i, sec in enumerate(sections):
+            info = prompts[i] if i < len(prompts) else {}
             st.markdown(f"### {sec['name']}")
-            if i < len(prompts):
-                st.markdown(
-                    f"<div class='muted-box'>{prompts[i].get('prompt', '')}</div>",
-                    unsafe_allow_html=True,
+            st.caption("Required fields: " + ", ".join(info.get("required_fields", [])))
+            prompt_text = info.get("prompt", "")
+            if prompt_text:
+                st.text_area(
+                    "Prompt",
+                    value=prompt_text,
+                    height=min(400, max(120, 80 + prompt_text.count("\n") * 18)),
+                    key=f"saved_prompt_{i}",
+                    disabled=True,
+                    label_visibility="collapsed",
                 )
-            st.markdown("")
+            else:
+                st.info("No prompt for this section.")
     st.success("Extraction and prompts ready.")
 
     # Step 4 (summary)

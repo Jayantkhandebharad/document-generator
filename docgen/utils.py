@@ -177,8 +177,9 @@ RULES:
 1. Check ALL field values and the case summary. Match each [placeholder] to the right source (e.g. [plaintiff_name] → the exact name from plaintiff_name or case summary, not a full sentence).
 2. Fill with the EXACT VALUE only: for a name use only the name; for a date use only the date; for an amount use only the number; for an address use only the address. Do NOT paste whole sentences or the full field response — extract the precise value that the placeholder asks for.
 3. For any attorney-related placeholder (e.g. attorney name, attorney address, signing attorney): if it is unclear which party's attorney is meant, use the plaintiff's attorney details.
-4. If the information is not clearly present in the context, leave the placeholder exactly as [placeholder]. Do not invent or guess.
-5. Return ONLY the filled draft, no explanation or commentary.
+4. For county or jurisdiction: use the same value from the context (field county, jurisdiction, or jurisdiction_county). Do not copy county from the sample document text—use only the value from the context. Use that single value for every [county], [jurisdiction], or "County of X"-style placeholder so it is consistent throughout.
+5. If the information is not clearly present in the context, leave the placeholder exactly as [placeholder]. Do not invent or guess.
+6. Return ONLY the filled draft, no explanation or commentary.
 
 Context:
 ---
@@ -244,6 +245,12 @@ def _lookup_field_value(placeholder: str, field_values: dict):
     v = field_values.get(normalized)
     if v is not None and str(v).strip():
         return v
+    # 2b. County/jurisdiction synonyms: [county], [jurisdiction], [County of X] etc. can come from county, jurisdiction, or jurisdiction_county
+    if normalized == "county" or normalized == "jurisdiction" or "county" in normalized or "jurisdiction" in normalized:
+        for key in ("county", "jurisdiction", "jurisdiction_county"):
+            v = field_values.get(key)
+            if v is not None and str(v).strip():
+                return v
     # 3. Any key that equals normalized or contains it (e.g. [Date] -> date_of_filing)
     for key, val in field_values.items():
         if not key or val is None or not str(val).strip():

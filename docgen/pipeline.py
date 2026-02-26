@@ -10,7 +10,7 @@ from docgen.field_fetcher import FieldFetcher
 from docgen.question_generator import QuestionGenerator
 from docgen.section_generator import SectionGenerator
 from docgen.assembler import Assembler
-from docgen.utils import fill_placeholders_from_context_with_llm
+from docgen.utils import fill_placeholders_from_context_with_llm, fill_placeholders_from_field_values
 
 
 class Pipeline:
@@ -108,6 +108,8 @@ class Pipeline:
 
         final_draft = self._assembler.assemble(blueprint, section_texts_ordered)
         final_draft = fill_placeholders_from_context_with_llm(final_draft, field_values)
+        # Second pass: fill any remaining placeholders from obtained field values and case summary
+        final_draft = fill_placeholders_from_field_values(final_draft, field_values)
 
         return {
             "blueprint": blueprint,

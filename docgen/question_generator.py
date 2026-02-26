@@ -28,7 +28,7 @@ class QuestionGenerator:
             or q_lower == "where?"
             or q_lower.startswith("what is the date?")
             or (len(question) < 25 and "date" in q_lower and "accident" not in q_lower and "filing" not in q_lower and "incident" not in q_lower)
-            or (len(question) < 25 and "name" in q_lower and "plaintiff" not in q_lower and "defendant" not in q_lower and "attorney" not in q_lower)
+            or (len(question) < 25 and "name" in q_lower and "plaintiff" not in q_lower and "defendant" not in q_lower and "attorney" not in q_lower and "respondent" not in q_lower)
         )
         if generic:
             return QuestionGenerator._fallback_question(field_name)
@@ -45,6 +45,12 @@ class QuestionGenerator:
             return "What is the plaintiff's full name?"
         if "defendant" in lower and "name" in lower:
             return "What is the defendant's full name?"
+        if "recipient" in lower and "name" in lower:
+            return "What is the respondent's full name?"
+        if "recipient" in lower and ("address" in lower or "addr" in lower):
+            return "What is the respondent's full address?"
+        if "recipient" in lower:
+            return f"What is the respondent's {lower.replace('recipient ', '').replace('recipient', '').strip() or 'information'}?"
         if "attorney" in lower and "name" in lower:
             return "What is the attorney's full name?"
         if "verification" in lower or ("attorney" in lower and ("sign" in lower or "verif" in lower)):
@@ -69,6 +75,8 @@ class QuestionGenerator:
             return "What is the case number for this case?"
         if "court" in lower and "name" in lower:
             return "What is the name of the court where the case is filed?"
+        if "county" in lower:
+            return "What is the county (jurisdiction) for this case?"
         if "venue" in lower or "jurisdiction" in lower:
             return "What is the venue or jurisdiction for this case?"
         if "amount" in lower or "damages" in lower or "sum" in lower:
@@ -106,6 +114,7 @@ REQUIRED RULES (follow strictly):
 5. For addresses/places: state whose address or which place. BAD: "What is the address?" GOOD: "What is the plaintiff's full address?" or "Where did the incident occur?"
 6. For amounts: state what amount. BAD: "What is the amount?" GOOD: "What are the total damages claimed?" or "What is the settlement amount?"
 7. Derive the subject from the field name: plaintiff_name → plaintiff; date_of_accident → date of the accident; defendant_address → defendant's address; case_index_number → case index/docket number; attorney_name → attorney's name; incident_location → location where the incident occurred.
+8. For fields related to the RECIPIENT (e.g. recipient_name, recipient_address, recipient_*): always phrase the question using "respondent" (e.g. "What is the respondent's full name?", "What is the respondent's full address?", "What is the respondent's [X]?"). Do not use "recipient" in the question text—use "respondent" instead.
 
 FORMAT: Return ONLY valid JSON. Key = exact field name, value = the unambiguous question. Use double quotes. Escape internal quotes with backslash.
 Example:

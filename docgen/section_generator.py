@@ -1,5 +1,5 @@
 """
-Generate one section using the section prompt, extracted sample text for this section, and field values (from API).
+Generate one section using the section prompt, extracted sample text for this section, and field values (fetched data).
 Uses pre-extracted section sample text (no full-doc pass).
 Uses SectionGenerator class (OOP).
 """
@@ -40,7 +40,8 @@ class SectionGenerator:
         if (sample_text or "").strip():
             sample_block = f"""
 ---
-SAMPLE FOR THIS SECTION (replicate format, structure, and tone — only data will change):
+SAMPLE FOR THIS SECTION (replicate format, structure, and tone — data comes from Field data below):
+Names, places, dates, county, court, index no., addresses, and attorney info are never fixed; add each to required fields and use values from the fetched data, even when they appear the same in both samples. **County/jurisdiction: Do not copy from the sample** (e.g. do not copy "County of Kings" or "in the county of" from the sample). Use only the county or jurisdiction value from Field data above, or use [county] if missing.
 ---
 {(sample_text or "").strip()}
 ---
@@ -70,7 +71,7 @@ CASE SUMMARY: If Field data above includes "case_summary" or "case_summary_or_co
 
 CRITICAL — follow exactly:
 1. OUTPUT THE DOCUMENT TEXT ONLY for this section. Same layout and structure as the sample (court header, caption, body, date lines, signature blocks — whatever the sample for this section contains). No summaries or explanations. Only the real document text.
-2. FORMAT & STRUCTURE: Replicate the sample's format, structure, spacing, and numbering for this section. Use Field data above for all variable facts (names, dates, court, index no., addresses, attorney info). If a value is missing, use placeholders: [Date], [Index No.], [Judge Name], [Attorney Name], etc.
+2. FORMAT & STRUCTURE: Replicate the sample's format, structure, spacing, and numbering for this section. Use Field data above for all factual slots (names, places, dates, county, court, index no., addresses, attorney info)—names, places, dates, and county are always variable; add them to required fields and use only the fetched data, never copy from the sample even when values match. **County/jurisdiction: use only the value from Field data** (e.g. do not copy "County of X" from the sample—use the county/jurisdiction field from Field data or [county]). If a value is missing, use placeholders: [Date], [Index No.], [Judge Name], [Attorney Name], etc.
 3. DO NOT COPY VERBATIM: Adapt structure and style from the sample using the provided case data. Use formal court-appropriate legal language. Expand legal reasoning and factual allegations to match the depth of the sample.
 4. CONSISTENCY: Use the same party names, case number, court name, dates, addresses, and attorney information throughout (same spelling and form).
 5. MAXIMUM INFORMATION: Use all information in the Field data above, including the case summary when this section needs it. Do not omit facts, dates, or figures that appear in the Field data.

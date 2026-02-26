@@ -40,12 +40,12 @@ class SectionPromptGenerator:
             data = JsonParser.extract_json_from_llm(response)
         except ValueError:
             return {
-                "prompt": f'Reproduce the sample section\'s exact language, wording, and tone for "{section_name}". Use the same sentence structures and phrasing. Only the factual data (names, dates, numbers) comes from the Field data below—use those values and do not invent. If a value is missing, output [field_name]. Output only the section body, no title.',
+                "prompt": f'Reproduce the sample section\'s exact language, wording, and tone for "{section_name}". Use the same sentence structures and phrasing. All factual data (names, places, dates, county, numbers, addresses, court, etc.) comes from the Field data below—use those values only; never treat a value as fixed just because it is the same in both samples. If a value is missing, output [field_name]. Output only the section body, no title.',
                 "required_fields": [],
             }
         if not isinstance(data, dict):
             return {
-                "prompt": f'Reproduce the sample\'s exact language and tone for "{section_name}". Only substitute the variable data with the Field data below. Output only the section body.',
+                "prompt": f'Reproduce the sample\'s exact language and tone for "{section_name}". Substitute all factual data (names, places, dates, county, addresses, court, etc.) from the Field data below only; never treat values as fixed just because they are the same in both samples. Output only the section body.',
                 "required_fields": [],
             }
 
@@ -55,7 +55,7 @@ class SectionPromptGenerator:
             required_fields = [f.strip() for f in required_fields.split(",") if f.strip()]
 
         return {
-            "prompt": section_prompt.strip() or f'Reproduce the sample\'s exact language and tone for "{section_name}". Data from Field data below only. Output only the section body.',
+            "prompt": section_prompt.strip() or f'Reproduce the sample\'s exact language and tone for "{section_name}". All factual data (names, places, dates, county, etc.) from Field data below only; never treat names, places, dates, or county as fixed just because they are the same in both samples. Output only the section body.',
             "required_fields": list(required_fields),
         }
 

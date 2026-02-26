@@ -290,15 +290,16 @@ Perform two tasks and return a single JSON object.
 
 Task 1 — Section generation prompt:
 Write a detailed prompt that will be given to another LLM. The prompt must state the following clearly and firmly:
-1. FORMAT AND STRUCTURE FROM THE SAMPLE: The model must reproduce the sample section's **format, structure, layout, and tone** (headings, caption block, numbering style, "TO THE ABOVE NAMED DEFENDANT:", signature blocks, spacing). Variable facts (names, dates, court, index no., addresses, etc.) come from Field data only.
+1. FORMAT AND STRUCTURE FROM THE SAMPLE: The model must reproduce the sample section's **format, structure, layout, and tone** (headings, caption block, numbering style, "TO THE ABOVE NAMED DEFENDANT:", signature blocks, spacing). All factual slots (names, places, dates, county, court, index no., addresses, etc.) must be added to required fields and values taken from the fetched data—never from the sample text. Never treat names, places, dates, or county as fixed just because they are the same in both sample documents; they are always variable.
+1a. COUNTY / JURISDICTION: Whenever the section refers to a county or jurisdiction (e.g. "County of Kings", "in the county of", "resident of the County of", "this Court has jurisdiction"), include **county** or **jurisdiction** in required fields and use ONLY the value from fetched data. Never copy the county or jurisdiction from the sample text—it often differs by case.
 2. CASE TYPE MATTERS: The sample may be from a different type of case (e.g. premises liability, motor vehicle, medical malpractice). The model will be told the **new case type**. For **boilerplate** sections (caption, summons notice, signature), use the same wording and substitute data. For **cause-of-action-specific** sections (allegations, legal claims, negligence theories), use legal language **appropriate to the new case type**—do not copy the sample's substantive legal wording if it does not fit (e.g. do not use "premises" or "motor vehicle" language in a medical malpractice case).
-3. DATA FROM FIELD DATA ONLY: Every fact (party names, dates, amounts, case numbers, court name, etc.) must come from Field data. Do not invent. If a value is missing, output [field_name].
+3. DATA FROM FIELD DATA ONLY: Every fact (party names, places, dates, county, amounts, case numbers, court name, etc.) must come from the fetched field data. Do not invent. If a value is missing, output [field_name].
 4. OUTPUT: Only the actual document text as filed. No summaries, no "Here are the addresses...", no "The primary plaintiff is...". Document text only.
 5. LEGAL PROSE ONLY: The body of the section must be written as **continuous legal prose**—full sentences and paragraphs in formal court-appropriate language. Do NOT output bullet points, numbered sub-headers, or markdown-style lists.
 6. DOCUMENT RULES (all types): The prompt must require: same structure and section sequence as reference; each section once, no repeat or merge; clear separation between major parts (summons vs complaint, motion vs affidavit, etc.); formal court language; internal consistency (party names, case number, court, dates, addresses, attorney info); placeholders like [Date], [Index No.], [Judge Name], [Attorney Name] when data is missing; expand legal reasoning and allegations to match reference depth; logical progression (Jurisdiction → Facts → Legal Basis → Relief → Signatures → Verifications); do NOT copy text verbatim—adapt structure and style using case data; output only one clean finalized document with no analysis or explanations.
 
 Task 2 — Required fields:
-List ONLY the fields that are actually used or referenced in THIS section (snake_case). Do not list fields that do not appear in this section. For example, a caption section might need only plaintiff_name, defendant_name, case_number, court_name; a signature block might need attorney_name, date_of_filing. Extract from the documents which variables appear in this section—one section may need 2–4 fields, another more. One field per distinct value. These will be fetched from an API.
+List ONLY the fields that are actually used or referenced in THIS section (snake_case). Do not list fields that do not appear in this section. Include a field for every factual slot (names, places, dates, county, court, case number, attorney, etc.) that appears—never treat a value as fixed just because it is the same in both sample documents; names, places, dates, and county often differ between cases. Add each such slot to required fields; values will be fetched from data. **If the section mentions county or jurisdiction** (e.g. "County of X", "in the county of", "resident of the County of"), **always include county or jurisdiction in required_fields**—do not omit it just because both samples show the same county. One field per distinct value.
 
 Return ONLY this JSON (escape quotes as \\\" and newlines as \\n in the "prompt" value):
 {{
@@ -316,7 +317,9 @@ Return ONLY this JSON (escape quotes as \\\" and newlines as \\n in the "prompt"
 
 The sample below is the EXACT content that was extracted for this section. You will produce: a generation prompt and required fields. (Formatting—styles, spacing, numbering—will be applied in a later step.)
 
-Sample content for this section (only variable data will change in generation):
+IMPORTANT: Names, places, dates, county, court, index no., addresses, and attorney info are never fixed—even when they are the same in both samples. They are always variable. Add each such slot to required fields; values will be fetched from data. **County/jurisdiction: If the section mentions a county or jurisdiction** (e.g. "County of X", "in the county of"), **always add county or jurisdiction to required_fields**—never copy it from the sample. Do not omit any such slot from required fields.
+
+Sample content for this section:
 ---
 {sample_text or "(No sample; use standard legal format.)"}
 ---
@@ -328,13 +331,13 @@ Write a detailed prompt for another LLM that will generate ONLY this section —
 
 The generated prompt MUST:
 1. DEFINE SECTION SCOPE EXPLICITLY: State "This section is [name]. It contains exactly: [list what is in the sample]. Do NOT include [content that belongs to the previous or next section]."
-2. DATA FROM FIELD DATA ONLY: All variable facts (names, dates, court, index no., addresses, attorney) come from Field data. Missing → [field_name]. No invented facts.
+2. DATA FROM FIELD DATA ONLY: All variable facts (names, places, dates, county, court, index no., addresses, attorney) come from the fetched field data. Missing → [field_name]. No invented facts.
 3. OUTPUT: Only the actual document text for this section. No summaries, no meta-commentary. Document text only.
 4. LEGAL PROSE: Continuous formal legal prose; no bullets or markdown. For allegations/claims, adapt legal language to the new case type (do not copy sample's cause-of-action wording if it does not fit).
 5. ONE SECTION ONLY: The prompt must instruct the model to output ONLY the content for this section and to stop before the next section's heading or content.
 
 Task 2 — Required fields:
-List ONLY the fields that appear or are referenced in THIS section (snake_case). One field per distinct value. Extract from the sample. These will be fetched from an API.
+List ONLY the fields that appear or are referenced in THIS section (snake_case). One field per distinct value. Include a field for every factual slot (party names, places, dates, county, addresses, court, index no., attorney info, etc.) that appears in the section—never omit a field just because the two samples show the same value. **If the section mentions county or jurisdiction**, include county or jurisdiction in required fields. Add each such slot to required fields; values will be fetched from data. Extract from the sample.
 
 Return ONLY this JSON (escape quotes as \\\" and newlines as \\n in string values):
 {{
