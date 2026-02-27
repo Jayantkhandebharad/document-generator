@@ -277,27 +277,46 @@ def clear_body_italic(paragraph):
         pass
 
 
-def force_legal_run_format(paragraph):
-    """Force black color on all runs (legal standard). Italic is preserved so * in input is applied."""
+# Single font for entire document (legal standard)
+DEFAULT_DOCUMENT_FONT = "Times New Roman"
+
+
+def force_legal_run_format(paragraph, font_name: str | None = None):
+    """Force black color and no italic on all runs; optionally set one font for the whole document."""
     if not paragraph:
         return
+    name = font_name or DEFAULT_DOCUMENT_FONT
     try:
         for run in paragraph.runs:
             try:
                 run.font.color.rgb = RGBColor(0, 0, 0)
             except Exception:
                 pass
+            try:
+                run.font.italic = False
+            except Exception:
+                pass
+            try:
+                run.font.name = name
+            except Exception:
+                pass
     except Exception:
         pass
 
 
-def force_legal_run_format_document(doc):
-    """Force black color on every run (legal standard). Italics from * in text are preserved."""
+def force_legal_run_format_document(doc, font_name: str | None = None):
+    """Force one font, black color, and no italic on every run in the document (body and table cells)."""
     if not doc:
         return
+    name = font_name or DEFAULT_DOCUMENT_FONT
     try:
         for paragraph in doc.paragraphs:
-            force_legal_run_format(paragraph)
+            force_legal_run_format(paragraph, font_name=name)
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for paragraph in cell.paragraphs:
+                        force_legal_run_format(paragraph, font_name=name)
     except Exception:
         pass
 
@@ -513,7 +532,7 @@ def _apply_num_pr(paragraph, num_id: int, ilvl: int = 0):
 
 
 def _apply_run_format(run, fmt: dict):
-    """Apply stored run/font format (bold, italic, underline, font name/size). Color is not applied so output stays black (legal standard)."""
+    """Apply stored run/font format (bold, italic, underline, font size). Font name is NOT set here so the document keeps one singular font (set in force_legal_run_format_document). Color is not applied so output stays black (legal standard)."""
     if not fmt or not run:
         return
     font = run.font
@@ -523,8 +542,8 @@ def _apply_run_format(run, fmt: dict):
     except Exception:
         pass
     try:
-        if "italic" in fmt:
-            font.italic = fmt["italic"]
+        # Never keep italic in output; override any template or inline italic.
+        font.italic = False
     except Exception:
         pass
     try:
@@ -540,17 +559,12 @@ def _apply_run_format(run, fmt: dict):
                 font.underline = u
     except Exception:
         pass
-    try:
-        if "name" in fmt and fmt["name"]:
-            font.name = fmt["name"]
-    except Exception:
-        pass
+    # Do not set font.name from fmt; one document font is applied in force_legal_run_format_document.
     try:
         if "size_pt" in fmt and fmt["size_pt"] is not None:
             font.size = Pt(fmt["size_pt"])
     except Exception:
         pass
-    # Force black text (legal standard); do not copy template color (e.g. blue). Italic is preserved from fmt for non-body; body gets no-italic in force_legal_run_format_document.
     try:
         font.color.rgb = RGBColor(0, 0, 0)
     except Exception:

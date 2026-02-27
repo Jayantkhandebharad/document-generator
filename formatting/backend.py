@@ -24,8 +24,8 @@ from utils.style_extractor import (
 )
 
 # Summons-style page margins (generous, like formal legal documents)
-DEFAULT_TOP_MARGIN_IN = 1.25
-DEFAULT_BOTTOM_MARGIN_IN = 1.25
+DEFAULT_TOP_MARGIN_IN = 1.0
+DEFAULT_BOTTOM_MARGIN_IN = 1.0
 DEFAULT_LEFT_MARGIN_IN = 1.25
 DEFAULT_RIGHT_MARGIN_IN = 1.25
 
@@ -44,6 +44,23 @@ def _apply_default_margins(doc):
 
 def _project_dir():
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def _get_document_font_from_schema(schema: dict) -> str:
+    """Pick one font name from the template schema so the whole document uses that font. Prefer paragraph/normal style."""
+    style_formatting = schema.get("style_formatting") or {}
+    style_map = schema.get("style_map") or {}
+    for style_key in (style_map.get("paragraph"), "Normal", "Body Text", "List Paragraph"):
+        if not style_key:
+            continue
+        rf = (style_formatting.get(style_key) or {}).get("run_format") or {}
+        if rf.get("name"):
+            return str(rf["name"]).strip()
+    for fmt in style_formatting.values():
+        rf = (fmt or {}).get("run_format") or {}
+        if rf.get("name"):
+            return str(rf["name"]).strip()
+    return "Times New Roman"
 
 
 def get_document_preview_text(docx_path: str) -> str:
@@ -146,7 +163,8 @@ def process_document(generated_text, template_file):
         bold_phrases_from_template=schema.get("bold_phrases_from_template"),
         caption_table_layout=schema.get("caption_table_layout"),
     )
-    force_legal_run_format_document(doc)
+    document_font = _get_document_font_from_schema(schema)
+    force_legal_run_format_document(doc, font_name=document_font)
     remove_trailing_empty_and_noise(doc)
 
     output_path = os.path.join(project_dir, "output", "formatted_output.docx")

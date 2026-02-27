@@ -407,12 +407,12 @@ def html_to_docx_bytes(html: str, font_name: str | None = None, font_size_pt: fl
                 continue
             run = p.add_run(text)
             run.bold = bold or legal_fmt.get("bold", False)
-            run.italic = italic or legal_fmt.get("italic", False)
+            # Never output italic from HTML (legal documents should not be italicised)
+            run.italic = False
             if underline or legal_fmt.get("underline", False):
                 run.font.underline = True
-            run_font = inline_font or font_name
-            if run_font:
-                run.font.name = run_font
+            # One font for the whole document; ignore inline font from HTML
+            run.font.name = font_name
             run.font.size = Pt(font_size_pt)
 
     # If the document would open blank (no paragraphs or all empty), add content from raw HTML text
