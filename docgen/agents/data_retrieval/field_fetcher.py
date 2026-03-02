@@ -514,28 +514,28 @@ Reply with exactly one word: ANSWER or NON_ANSWER. No explanation."""
                 self._human_delay(min_delay, max_delay)
         return result
 
-    def _extract_fields_from_chunk(self, chunk: str, missing_fields: set[str]) -> dict[str, dict]:
+    def _extract_fields_from_chunk(self, chunk: str, missing_fields: set[str]) -> tuple[dict[str, dict], list[str]]:
         """
         Helper method to call LLM for a single chunk.
-        Returns a dict of found fields: { "field_name": { "value": "...", "confidence": "HIGH"/"LOW" } }
+        Returns tuple:
+          1. dict of found fields: { "field_name": { "value": "...", "confidence": "HIGH"/"LOW" } }
+          2. list of extracted fact strings
         """
         # Sort fields to ensure deterministic prompt
         current_fields = sorted(missing_fields)
         
-        # Batching logic
+        # Batching logic (if many fields missing)
         if len(current_fields) > 50:
              field_batches = [current_fields[j:j+50] for j in range(0, len(current_fields), 50)]
         else:
              field_batches = [current_fields]
 
         results = {}
+        all_key_facts = []
 
         for batch in field_batches:
-            # print(f"[FieldFetcher]     - Searching for {len(batch)} fields: {batch}")
-            
             fields_list_str = ', '.join(batch)
             
-            # Construct prompt asking for specific fields and confidence scores
             prompt = f"""You are extracting data for a legal case from a document chunk.
 Target Fields: {fields_list_str}
 
@@ -546,18 +546,18 @@ Chunk Content:
 
 INSTRUCTIONS:
 1. Extract values for the target fields ONLY if present in the text.
-2. For each extracted value, assign a CONFIDENCE score:
-   - "HIGH": Explicitly stated, unambiguous.
-   - "LOW": Inferred, ambiguous, or partial match.
-3. Return a JSON object with a single key "items", containing a list of objects.
-   - Format: {{ "items": [ {{ "field": "FIELD_NAME", "value": "EXTRACTED_VALUE", "confidence": "HIGH"|"LOW" }}, ... ] }}
-4. Omit fields not found.
+2. For each extracted value, assign a CONFIDENCE score ("HIGH" or "LOW").
+3. **ALSO EXTRACT "key_facts"**: Identify 3-5 key factual assertions, dates, or significant events found in this text that are relevant to the legal case (even if they don't match a specific field). Brief bullet points.
+4. Return a JSON object with keys: "items" (list of fields) and "key_facts" (list of strings).
 
 Example:
 {{
   "items": [
-    {{ "field": "plaintiff_name", "value": "John Doe", "confidence": "HIGH" }},
-    {{ "field": "incident_date", "value": "2023-01-01", "confidence": "LOW" }}
+    {{ "field": "plaintiff_name", "value": "John Doe", "confidence": "HIGH" }}
+  ],
+  "key_facts": [
+    "Incident occurred on Jan 1, 2023 at Main St.",
+    "Plaintiff was treated at Mercy Hospital."
   ]
 }}
 """
@@ -577,9 +577,13 @@ Example:
                             "required": ["field", "value", "confidence"],
                             "additionalProperties": False
                         }
+                    },
+                    "key_facts": {
+                        "type": "array",
+                        "items": {"type": "string"}
                     }
                 },
-                "required": ["items"],
+                "required": ["items", "key_facts"],
                 "additionalProperties": False
             }
 
@@ -587,7 +591,6 @@ Example:
                 # Call LLM with schema
                 raw_resp = self._llm.generate(prompt, json_mode=True, max_tokens=4096, response_schema=schema)
                 
-                # Use robust JsonParser instead of fragile regex/string splitting
                 from docgen.core.utils import JsonParser
                 data = JsonParser.extract_json_from_llm(raw_resp)
                 
@@ -595,22 +598,28 @@ Example:
                     continue
 
                 items_list = []
-                # Normalize data to list of items
+                key_facts_list = []
+
                 if isinstance(data, dict):
-                    if "items" in data and isinstance(data["items"], list):
-                         items_list = data["items"]
-                    else:
-                        # Fallback for old dict format or mismatched schema result
-                        for k, v in data.items():
+                    items_list = data.get("items", [])
+                    key_facts_list = data.get("key_facts", [])
+                    # Fallback for old format if 'items' missing but dict has keys
+                    if not items_list and not key_facts_list:
+                         for k, v in data.items():
                              if k == "items": continue
+                             if k == "key_facts": continue
                              if isinstance(v, dict):
                                 items_list.append({"field": k, "value": v.get("value"), "confidence": v.get("confidence")})
                              else:
                                 items_list.append({"field": k, "value": v, "confidence": "LOW"})
-                elif isinstance(data, list):
-                     items_list = data
-                
-                # Process results
+
+                # Collect facts
+                if isinstance(key_facts_list, list):
+                    for f in key_facts_list:
+                        if isinstance(f, str) and len(f) > 5:
+                            all_key_facts.append(f)
+
+                # Process field results
                 for item in items_list:
                     if not isinstance(item, dict):
                         continue
@@ -625,12 +634,11 @@ Example:
                     results[field] = {"value": val, "confidence": conf}
 
             except ValueError as e:
-                # JsonParser raises ValueError if it can't parse
                 print(f"[FieldFetcher]     - Error: {e}. Full Response:\n{raw_resp}")
             except Exception as e:
                 print(f"[FieldFetcher]     - Error processing chunk: {e}")
         
-        return results
+        return results, all_key_facts
 
     def fetch_fields_from_case_search(
         self,
@@ -639,11 +647,12 @@ Example:
         firm_id: str | int = 1,
         on_doc_start: Callable[[str, int, int], None] | None = None,
         on_field_found: Callable[[str, str, str], None] | None = None, # field, value, confidence
+        category_of_document: str = "",
     ) -> dict[str, Any]:
         """
         Fetch field values by searching documents in Azure Search for the given case_id.
         Iteratively processes documents to find missing fields.
-        Uses DocumentFetcher to handle Azure Search and temp file storage.
+        ALSO accumulates key facts to generate a 'case_summary'.
         """
         from docgen.agents.data_retrieval.document_fetcher import DocumentFetcher
 
@@ -653,6 +662,7 @@ Example:
         missing_fields = set(required_fields)
         found_values = {}
         confused_values = {} 
+        collected_facts = [] # List of strings
 
         # Using DocumentFetcher as a context manager ensures automatic cleanup of temp files
         with DocumentFetcher() as fetcher:
@@ -665,8 +675,12 @@ Example:
 
             # Iterate through documents one by one
             for doc in fetcher.iter_documents():
-                if not missing_fields:
-                    print("[FieldFetcher] All fields found. Stopping document processing.")
+                # We continue even if all fields are found, just to collect more facts?
+                # Decision: Stop if fields found AND we have enough facts (e.g. > 20).
+                # For now, let's stick to the field stopping condition but maybe peek at a few more docs if facts are sparse?
+                # Actually, user wants facts. Let's process at least top 3 documents fully for facts even if fields are found.
+                if not missing_fields and len(collected_facts) > 30:
+                    print("[FieldFetcher] All fields found and facts collected. Stopping.")
                     break
                     
                 doc_name = doc["name"]
@@ -681,18 +695,22 @@ Example:
                 
                 # Split content
                 chunks = self._split_text(doc_content)
-                print(f"[FieldFetcher]   - Document split into {len(chunks)} chunks for LLM processing.")
+                print(f"[FieldFetcher]   - Document split into {len(chunks)} chunks.")
                 
-                # Free doc_content from memory immediately as chunks are created
                 del doc_content
                 
                 for c_idx, chunk in enumerate(chunks):
-                    if not missing_fields:
+                    # If we found all fields, we might still want to scan for facts in early important docs.
+                    # Heuristic: Scan for facts if we are in the first 3 docs or still missing fields.
+                    if not missing_fields and idx > 3:
                         break
-                    
+
                     # Call helper to process chunk
-                    chunk_results = self._extract_fields_from_chunk(chunk, missing_fields)
+                    chunk_results, chunk_facts = self._extract_fields_from_chunk(chunk, missing_fields)
                     
+                    # Accumulate facts
+                    collected_facts.extend(chunk_facts)
+
                     found_in_chunk = 0
                     for field, res in chunk_results.items():
                         if field not in missing_fields:
@@ -714,12 +732,11 @@ Example:
                             if field in confused_values:
                                 del confused_values[field]
                         else:
-                            # Store LOW confidence value only if we don't have one yet
                             if field not in confused_values:
                                 confused_values[field] = val
                     
                     if found_in_chunk == 0:
-                        print(f"[FieldFetcher]     - No target fields found in chunk {c_idx+1}.")
+                        pass # print(f"[FieldFetcher]     - No target fields found in chunk {c_idx+1}.")
         
         # Final merge: use confused values for anything not found with HIGH confidence
         for k, v in confused_values.items():
@@ -727,8 +744,48 @@ Example:
                 found_values[k] = v
                 print(f"[FieldFetcher] Using LOW confidence value for '{k}': '{v}'")
         
+        # --- Synthesize Case Summary from Collected Facts ---
+        if collected_facts:
+            print(f"[FieldFetcher] Synthesizing case summary from {len(collected_facts)} collected facts...")
+            summary = self._synthesize_case_summary(collected_facts, category_of_document)
+            found_values["case_summary"] = summary
+            print("[FieldFetcher] Case Summary generated.")
+        else:
+            found_values["case_summary"] = "No facts collected to generate summary."
+
         print(f"[FieldFetcher] Search complete. Found {len(found_values)}/{len(required_fields)} fields.")
         return found_values
+
+    def _synthesize_case_summary(self, facts: list[str], category: str) -> str:
+        """Use LLM to condense a list of facts into a coherent summary."""
+        # Deduplicate and limit
+        unique_facts = sorted(list(set(facts)))
+        if len(unique_facts) > 100:
+            # If too many, take a sampling or first/last to fit context
+            unique_facts = unique_facts[:100]
+        
+        facts_text = "\n".join(f"- {f}" for f in unique_facts)
+        
+        prompt = f"""You are a legal assistant.
+Task: Create a concise "Case Summary" from the following raw collected facts.
+This summary will be used to draft a "{category}".
+
+Raw Facts:
+---
+{facts_text}
+---
+
+Instructions:
+1. Synthesize the facts into a coherent narrative (3-5 paragraphs).
+2. Focus on: Parties involved, Key Dates, The Incident/Dispute, Damages/Injuries, and Legal Context.
+3. Ignore irrelevant or repetitive details.
+4. Output ONLY the summary text.
+"""
+        try:
+            return self._llm.generate(prompt, max_tokens=1000, temperature=0.2).strip()
+        except Exception as e:
+            print(f"[FieldFetcher] Summary generation failed: {e}")
+            return "Summary generation failed."
 
     @staticmethod
     def _split_text(text: str, chunk_size=35000, chunk_overlap=400) -> list[str]:
@@ -891,11 +948,13 @@ def fetch_fields_from_case_search(
     firm_id: str | int = 1,
     on_doc_start: Callable[[str, int, int], None] | None = None,
     on_field_found: Callable[[str, str, str], None] | None = None,
+    category_of_document: str = "",
 ) -> dict[str, Any]:
     return FieldFetcher().fetch_fields_from_case_search(
         case_id=case_id, 
         required_fields=required_fields, 
         firm_id=firm_id, 
         on_doc_start=on_doc_start,
-        on_field_found=on_field_found
+        on_field_found=on_field_found,
+        category_of_document=category_of_document
     )

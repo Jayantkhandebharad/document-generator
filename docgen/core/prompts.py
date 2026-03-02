@@ -260,12 +260,12 @@ Document 2:
 """
 
     @staticmethod
-    def build_sectioning_prompt(doc1: str, doc2: str) -> str:
+    def build_sectioning_prompt(doc1: str) -> str:
         """Prompt so the LLM divides both documents into logical sections."""
         return f"""You are an expert document analyst. Your task is to identify CLEARLY DEFINED sections so that every part of the document can be accurately extracted and assigned to exactly one section.
 
 Step 1 — Analyze the reference documents:
-- Document type (e.g. Motion, Summons & Complaint, Notice of Claim, Petition, Affidavit)
+- Document type (e.g. Motion, Summons & Complaint, Notice of Claim, Petition, Affidavit, or any other legal document type)
 - Every heading, label, or distinct block that appears in the documents (use exact wording when present, e.g. "SUMMONS", "FIRST CAUSE OF ACTION", "VERIFICATION")
 - Strict reading order from top to bottom
 - Writing style and level of legal detail
@@ -273,9 +273,9 @@ Step 1 — Analyze the reference documents:
 Step 2 — Output the section list. CRITICAL: sections must be clearly identified and accurate for extraction.
 
 Requirements:
-- CLEAR IDENTIFICATION: Use the exact section heading as it appears in the document when there is one (e.g. "HEADING" ,"SUMMONS", "COMPLAINT", "PRAYER FOR RELIEF"). When there is no heading, use a precise standard name (e.g. "Caption", "Signature Block", "Verification").
+- CLEAR IDENTIFICATION: Use the exact section heading as it appears in the document when there is one (e.g. "HEADING" ,"SUMMONS", "COMPLAINT", "PRAYER FOR RELIEF", etc.). When there is no heading, use a precise standard name (e.g. "Caption", "Signature Block", "Verification").
 - SPECIFIC PURPOSE: For each section, write a "purpose" that describes exactly what content belongs in that section so extraction can assign every line correctly. Examples: "Court name, case index number, party names, and case title at top of first page"; "Summons notice text and 'TO THE ABOVE NAMED DEFENDANT' through end of summons"; "Numbered allegations or causes of action only".
-- MORE SECTIONS IS BETTER: Prefer more, clearly separated sections over fewer merged ones. Split distinct parts (e.g. "Caption" and "Parties/Case Title", "Signature" and "Date", "Verification" and "Certification", each "Cause of Action" if numbered separately). At least 11 sections; 12–18 or more is preferred when the documents have many distinct parts.
+- MORE SECTIONS IS BETTER: Prefer more, clearly separated sections over fewer merged ones. Split distinct parts (e.g. "Caption" and "Parties/Case Title", "Signature" and "Date", "Verification" and "Certification", each "Cause of Action" if numbered separately). At least 11 sections; 12-18 or more is preferred when the documents have many distinct parts.
 - ONE-TO-ONE: Every line of both documents must belong to exactly one section. No gaps, no overlap. Sections are in strict reading order.
 - FULL COVERAGE: Include all distinct parts: caption, court/venue, parties, summons text, complaint/petition body, each cause of action or allegation block if separate, prayer for relief, signature block, date, verification, certification, filing instructions, proof of service, etc.
 
@@ -293,11 +293,6 @@ Output format — return valid JSON only:
 Document 1:
 ---
 {doc1}
----
-
-Document 2:
----
-{doc2}
 ---
 """
 

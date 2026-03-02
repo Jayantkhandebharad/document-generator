@@ -211,8 +211,6 @@ def run_pipeline():
     else:
         st.caption("Loaded Category from Blueprint.")
 
-    with open("category_of_document.txt", "wb") as f:
-        f.write(str(category_of_document).encode("utf-8"))
 
     # =====================================================
     # STEP 1 — Section identification (fade-in, slow)
@@ -360,7 +358,8 @@ def run_pipeline():
             firm_id=firm_id_input,
             required_fields=all_required,
             on_doc_start=on_doc_progress,
-            on_field_found=on_field_found_callback
+            on_field_found=on_field_found_callback,
+            category_of_document=category_of_document
         )
         
         status_placeholder.markdown(f"**Done.** Found {len(field_values)} of {len(all_required)} fields.")
