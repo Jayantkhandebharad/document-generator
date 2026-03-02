@@ -3,6 +3,7 @@
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 from utils.style_extractor import build_section_formatting_prompts
 
@@ -11,6 +12,36 @@ _LLM_REFUSAL_PATTERN = re.compile(
     r"\s*I'm sorry, but I can't assist with that\.?\s*",
     re.IGNORECASE,
 )
+
+# Explicit page break in raw text: a line of six or more backticks. Post-processing expands these into page_break blocks.
+PAGE_BREAK_MARKER_REGEX = re.compile(r"\n\s*`{6,}\s*\n", re.MULTILINE)
+
+
+def _strip_page_break_marker_in_text(text: str) -> str:
+    """Remove the page-break marker line (6+ backticks) from text. Used for slot-fill so the marker does not appear in output."""
+    if not text:
+        return text
+    return PAGE_BREAK_MARKER_REGEX.sub("\n", text).strip()
+
+
+def _expand_page_break_markers(blocks: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Expand any block whose text contains the page-break marker into multiple blocks with page_break inserted.
+    For free-form output only. Ensures explicit page breaks in raw text become doc.add_page_break() in the formatter."""
+    if not blocks:
+        return blocks
+    out = []
+    for block_type, text in blocks:
+        if not text or not PAGE_BREAK_MARKER_REGEX.search(text):
+            out.append((block_type, text))
+            continue
+        parts = PAGE_BREAK_MARKER_REGEX.split(text)
+        for i, part in enumerate(parts):
+            stripped = part.strip()
+            if stripped:
+                out.append((block_type, stripped))
+            if i < len(parts) - 1:
+                out.append(("page_break", ""))
+    return out
 
 
 def _strip_llm_refusal_artifact(raw: str) -> str:
@@ -367,7 +398,7 @@ Rules (apply to any document type):
 - Signature block -> use the template style; use block_type signature_line for the underline line.
 - Separator lines (dashes/dots ending in X) -> block_type line, exact line characters in text.
 - Section underlines (solid line under a cause of action or heading) -> block_type section_underline, empty text "".
-- Page breaks -> output page_break (empty text) before each major section that starts on a new page in the template. Look at the template structure to see where sections begin.
+- Page breaks -> output page_break (empty text) before each major section that starts on a new page in the template. Look at the template structure to see where sections begin. If the raw text contains a line of six or more backticks (e.g. ``````), treat it as an explicit page break: output a block with block_type page_break and empty text at that position; do not include the backtick line in any content block.
 - Motion packs (Notice of Motion + Affirmation + Affidavit): output all documents in order. Each document has a caption (court, county, parties, index no., document title like NOTICE OF MOTION TO RESTORE / AFFIRMATION IN SUPPORT / AFFIDAVIT OF SERVICE) then body. Use the same template styles for caption and body as in the template. Do not merge multiple documents into one; keep each document's caption and body as separate blocks in sequence.
 - Checkboxes: Use [ ] and [x] in text; they render as checkbox symbols.
 
@@ -463,7 +494,7 @@ def _call_openai(
 
 ---
 
-Raw text to format. (1) Divide it into sections according to the uploaded document structure above. (2) Match each section with the styling and formatting of the uploaded document: assign the block_type (style name) that the template uses for that section. Use the same styles for titles, section headings, body paragraphs, and lists as in the template. For causes of action (e.g. negligence): output each allegation (each "That on...", "By reason of...", etc.) as a separate block with the template's list/numbered style; do not add "1." or "2." in the text—numbering is applied from the template. Insert page_break where the template starts a new section on a new page. Include every part of the raw text to the very end—do not stop after the first signature block; if WHEREFORE, verification, SUMMONS AND VERIFIED COMPLAINT, certification, or NOTICE OF ENTRY appear later in the raw text, output blocks for all of them. In the text field use ** for bold, * for italic, and __ for underline only where the template has selective emphasis (e.g. NOTICE OF CLAIM: bold title, party names, -Against-, PLEASE TAKE NOTICE, firm names, key terms like Personal Injury Action, dates/addresses when emphasized; italic only for "respondent"/"claimant" in parentheses; underline only when the template underlines a phrase). Do not bold/italic entire paragraphs or plain capitalized words. Output a JSON array of {{"block_type": "<style name or line/signature_line/page_break>", "text": "<content>"}}.
+Raw text to format. (1) Divide it into sections according to the uploaded document structure above. (2) Match each section with the styling and formatting of the uploaded document: assign the block_type (style name) that the template uses for that section. Use the same styles for titles, section headings, body paragraphs, and lists as in the template. For causes of action (e.g. negligence): output each allegation (each "That on...", "By reason of...", etc.) as a separate block with the template's list/numbered style; do not add "1." or "2." in the text—numbering is applied from the template. Insert page_break where the template starts a new section on a new page. If the raw text contains a line of six or more backticks (e.g. ``````), output a block with block_type page_break and empty text at that position; do not include the backtick line in any content block. Include every part of the raw text to the very end—do not stop after the first signature block; if WHEREFORE, verification, SUMMONS AND VERIFIED COMPLAINT, certification, or NOTICE OF ENTRY appear later in the raw text, output blocks for all of them. In the text field use ** for bold, * for italic, and __ for underline only where the template has selective emphasis (e.g. NOTICE OF CLAIM: bold title, party names, -Against-, PLEASE TAKE NOTICE, firm names, key terms like Personal Injury Action, dates/addresses when emphasized; italic only for "respondent"/"claimant" in parentheses; underline only when the template underlines a phrase). Do not bold/italic entire paragraphs or plain capitalized words. Output a JSON array of {{"block_type": "<style name or line/signature_line/page_break>", "text": "<content>"}}.
 
 ---
 {text}
@@ -514,13 +545,14 @@ Raw text to format. (1) Divide it into sections according to the uploaded docume
 
     # Default 16384 (many models' max). Set FORMATTER_LLM_MAX_TOKENS for models that allow more (e.g. 32768).
     max_tokens = int(os.environ.get("FORMATTER_LLM_MAX_TOKENS", "16384"))
+    # Use temperature=0.0 so block segmentation is as deterministic as possible.
     resp = client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": content},
         ],
-        temperature=0.1,
+        temperature=0.0,
         max_tokens=max_tokens,
     )
     raw = resp.choices[0].message.content.strip()
@@ -594,6 +626,209 @@ Section discipline: Caption (court header), NOTICE blocks, PROOF OF SERVICE, WHE
 Output JSON only: one object per template slot with a "text" field. Example: [{"text": "..."}, {"text": ""}, ...]."""
 
 
+# Section-specific instructions for multi-agent slot-fill (appended to SLOT_FILL_SYSTEM per section)
+SECTION_SYSTEM_PROMPTS = {
+    "caption": (
+        " You are filling ONLY CAPTION slots: court name, county, parties, -against-, index no., document title (e.g. NOTICE OF MOTION TO RESTORE). "
+        "Find the matching text in the raw document and assign to the correct slot. Use empty string for line/separator slots."
+    ),
+    "motion_notice": (
+        " You are filling ONLY MOTION NOTICE / body-of-notice slots (e.g. PLEASE TAKE NOTICE, motion text). "
+        "Do not put caption or attorney signature content here. Use empty string for line/separator slots."
+    ),
+    "body": (
+        " You are filling ONLY BODY slots (narrative, allegations, WHEREFORE, demands for relief). "
+        "One block per allegation; do not add '1.' '2.' in text—numbering is applied by the template. Use empty string for line/section_underline slots."
+    ),
+    "attorney_signature": (
+        " You are filling ONLY ATTORNEY SIGNATURE slots: Dated, attorney name, firm, Attorneys for Plaintiff/Defendant, address, phone. "
+        "Preserve spacing and line structure. Use empty string for signature underline slots."
+    ),
+    "notary": (
+        " You are filling ONLY NOTARY / jurat slots (Sworn to before me, Notary Public, State of, County of). "
+        "Preserve wording exactly. Use empty string for signature line slots."
+    ),
+    "to_section": (
+        " You are filling ONLY TO: / recipient slots (TO:, firm name, address lines). "
+        "One slot per line if the template has multiple. Use empty string for separator slots."
+    ),
+    "affirmation": (
+        " You are filling ONLY AFFIRMATION slots (e.g. affirms the following, respectfully submitted, WHEREFORE in affirmation). "
+        "Preserve structure. Use empty string for line/section_underline slots."
+    ),
+    "affidavit": (
+        " You are filling ONLY AFFIDAVIT slots (duly sworn, under penalties of perjury, body paragraphs). "
+        "Use empty string for signature line slots."
+    ),
+    "separator": (
+        " You are filling ONLY separator/line slots. Output empty string for each slot unless the template line characters are to be preserved."
+    ),
+}
+
+
+def _get_section_system_prompt(section_type: str) -> str:
+    """Return full system prompt for one section (SLOT_FILL_SYSTEM + section-specific lines)."""
+    extra = SECTION_SYSTEM_PROMPTS.get(section_type, SECTION_SYSTEM_PROMPTS["body"])
+    return SLOT_FILL_SYSTEM + extra
+
+
+def _call_openai_slot_fill_one_section(
+    text: str,
+    style_schema: dict,
+    start: int,
+    end: int,
+    template_structure: list[dict],
+) -> list[str]:
+    """Call LLM to fill slots for one section (indices [start:end]). Returns list of (end - start) text strings."""
+    if start >= end:
+        return []
+    section_specs = template_structure[start:end]
+    section_type = section_specs[0].get("section_type", "body") if section_specs else "body"
+    N_local = end - start
+
+    # Block descriptions for this section only (local indices 0..N_local-1)
+    block_descriptions = []
+    for local_i, spec in enumerate(section_specs):
+        kind = spec.get("block_kind", "paragraph")
+        style = spec.get("style", "Normal")
+        hint = (spec.get("hint") or "")[:100]
+        st = spec.get("section_type", "body")
+        if kind == "line":
+            block_descriptions.append(f"Slot {local_i}: [{st}] [line/separator]. Use empty string.")
+        elif kind == "signature_line":
+            block_descriptions.append(f"Slot {local_i}: [{st}] [signature underline]. Use empty string.")
+        elif kind == "section_underline":
+            block_descriptions.append(f"Slot {local_i}: [{st}] [section underline]. Use empty string.")
+        else:
+            block_descriptions.append(f"Slot {local_i}: [{st}] style={style}. Hint: \"{hint}\"")
+    blocks_desc = "\n".join(block_descriptions)
+
+    user_content = f"""You are filling ONLY the slots for the "{section_type.upper()}" section (slots {start}–{end - 1} of the full document). The raw document is below—find the text that belongs in THIS section and assign it to the correct slot. Output a JSON array of exactly {N_local} objects: [{{\"text\": \"...\"}}, ...].
+
+Slots for this section:
+{blocks_desc}
+
+For [line/separator], [signature underline], and [section underline] use empty string "".
+
+Raw text:
+---
+{text}
+---"""
+
+    if not OpenAI and not AzureOpenAI:
+        raise RuntimeError("openai package not installed. pip install openai")
+
+    azure_key = os.environ.get("AZURE_OPENAI_API_KEY") or os.environ.get("AZURE_OPENAI_KEY")
+    azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+    if azure_key and azure_endpoint:
+        if not AzureOpenAI:
+            raise RuntimeError("Azure OpenAI requested but openai package may be too old. pip install openai>=1.0.0")
+        client = AzureOpenAI(
+            api_key=azure_key,
+            api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-15-preview"),
+            azure_endpoint=azure_endpoint.rstrip("/"),
+        )
+        model = os.environ.get("AZURE_OPENAI_DEPLOYMENT") or os.environ.get("FORMATTER_LLM_MODEL", "gpt-4o-mini")
+    else:
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "Set OPENAI_API_KEY for OpenAI, or AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT for Azure OpenAI"
+            )
+        client = OpenAI(api_key=api_key)
+        model = os.environ.get("FORMATTER_LLM_MODEL", "gpt-4o-mini")
+
+    max_tokens = int(os.environ.get("FORMATTER_LLM_MAX_TOKENS", "16384"))
+    system_prompt = _get_section_system_prompt(section_type)
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        temperature=0.0,
+        max_tokens=max_tokens,
+    )
+    raw = resp.choices[0].message.content.strip()
+    raw = _strip_llm_refusal_artifact(raw)
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+    raw = _sanitize_json_control_chars(raw)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        raw_fallback = re.sub(r"[\x00-\x1f]", " ", raw)
+        try:
+            data = json.loads(raw_fallback)
+        except json.JSONDecodeError:
+            extracted = _extract_text_values_from_json_array(raw_fallback, N_local)
+            if extracted is not None:
+                return extracted[:N_local]
+            extracted = _extract_text_values_from_json_array(raw, N_local)
+            if extracted is not None:
+                return extracted[:N_local]
+            data = _recover_truncated_slot_json(raw_fallback, N_local)
+            if data is None:
+                data = _recover_truncated_slot_json(raw, N_local)
+            if data is None:
+                raise
+    out = []
+    for i, item in enumerate(data):
+        if i >= N_local:
+            break
+        t = (item.get("text") or "").strip() if isinstance(item, dict) else ""
+        out.append(t)
+    while len(out) < N_local:
+        out.append("")
+    return out[:N_local]
+
+
+def _slot_fill_by_section(text: str, style_schema: dict) -> list[str]:
+    """Multi-agent slot-fill: one LLM call per section, parallel execution, merge in order. Returns list of N slot texts."""
+    template_structure = style_schema.get("template_structure") or []
+    if not template_structure:
+        return []
+    N = len(template_structure)
+
+    # Build section ranges (section_type, start, end)
+    section_ranges = []
+    i = 0
+    while i < N:
+        st = template_structure[i].get("section_type", "body")
+        start = i
+        while i < N and template_structure[i].get("section_type") == st:
+            i += 1
+        section_ranges.append((st, start, i))
+
+    # Optional: skip API for sections that are only line/signature_line/section_underline (all empty)
+    def section_is_all_special(s_start: int, s_end: int) -> bool:
+        for j in range(s_start, s_end):
+            k = template_structure[j].get("block_kind", "paragraph")
+            if k not in ("line", "signature_line", "section_underline"):
+                return False
+        return True
+
+    max_workers = int(os.environ.get("FORMATTER_MULTI_AGENT_MAX_WORKERS", "5"))
+    max_workers = max(1, min(max_workers, 10))
+
+    def run_section(args):
+        st, start, end = args
+        if section_is_all_special(start, end):
+            return [""] * (end - start)
+        return _call_openai_slot_fill_one_section(text, style_schema, start, end, template_structure)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        section_results = list(executor.map(run_section, section_ranges))
+
+    slot_texts = []
+    for texts in section_results:
+        slot_texts.extend(texts)
+    while len(slot_texts) < N:
+        slot_texts.append("")
+    return slot_texts[:N]
+
+
 def _call_openai_slot_fill(text: str, style_schema: dict) -> list[str]:
     """Call LLM to fill N slots from template_structure. Returns list of N text strings."""
     template_structure = style_schema.get("template_structure") or []
@@ -648,6 +883,8 @@ Block list:
 {blocks_desc}
 
 For [line/separator], [signature underline], and [section underline] use empty string "". Output a JSON array of exactly {N} objects: [{{\"text\": \"...\"}}, {{\"text\": \"\"}}, ...].
+
+If the raw text contains a line of six or more backticks (e.g. ``````), do not include that line in any slot; omit it from your output.
 
 Raw text:
 ---
@@ -736,15 +973,22 @@ def format_text_with_llm(
     text = re.sub(r"\n{3,}", "\n\n", text).strip()  # collapse excess newlines left after removal
     template_structure = style_schema.get("template_structure") if use_slot_fill else None
     if template_structure:
-        slot_texts = _call_openai_slot_fill(text, style_schema)
+        use_multi_agent = os.environ.get("FORMATTER_MULTI_AGENT", "").strip().lower() in ("1", "true", "yes")
+        if use_multi_agent:
+            slot_texts = _slot_fill_by_section(text, style_schema)
+        else:
+            slot_texts = _call_openai_slot_fill(text, style_schema)
+        # Strip any page-break marker that slipped through so it does not appear in output
+        slot_texts = [_strip_page_break_marker_in_text(slot_texts[i] if i < len(slot_texts) else "") for i in range(len(template_structure))]
         # Return (style, text) per slot so formatter can use exact template structure
         return [
-            (template_structure[i].get("style", "Normal"), slot_texts[i] if i < len(slot_texts) else "")
+            (template_structure[i].get("style", "Normal"), slot_texts[i])
             for i in range(len(template_structure))
         ]
-    return _call_openai(
+    blocks = _call_openai(
         text,
         style_schema,
         template_page_images=template_page_images,
         template_page_ocr_texts=template_page_ocr_texts,
     )
+    return _expand_page_break_markers(blocks)

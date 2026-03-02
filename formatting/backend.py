@@ -1,9 +1,12 @@
 import base64
+import json
+import logging
 import os
 import tempfile
 
 from docx import Document
-from docx.shared import Inches
+from docx.enum.text import WD_LINE_SPACING
+from docx.shared import Inches, Pt
 
 from utils.docx_to_images import docx_to_page_images, docx_to_page_images_base64, ocr_page_images
 from utils.formatter import (
@@ -44,6 +47,61 @@ def _apply_default_margins(doc):
 
 def _project_dir():
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def _tighten_footer_spacing(doc):
+    """Tighten spacing on the last page footer that starts with SUPERIOR COURT / NEW HAVEN COUNTY.
+
+    We set space_before/space_after to 0 and use single line spacing from that footer
+    heading through the end of the document, so the summons-and-verified-complaint
+    footer page matches the sample's tight legal layout.
+    """
+    if not doc or not getattr(doc, "paragraphs", None):
+        return
+    start_idx = None
+    try:
+        for i, para in enumerate(doc.paragraphs):
+            t = (para.text or "").strip().upper()
+            if "SUPERIOR COURT" in t and "NEW HAVEN COUNTY" in t:
+                start_idx = i
+        if start_idx is None:
+            return
+        for para in doc.paragraphs[start_idx:]:
+            pf = para.paragraph_format
+            pf.space_before = Pt(0)
+            pf.space_after = Pt(0)
+            pf.line_spacing_rule = WD_LINE_SPACING.SINGLE
+            pf.line_spacing = 1
+        # Also tighten spacing inside tables (footer right column, etc.)
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for para in cell.paragraphs:
+                        pf = para.paragraph_format
+                        pf.space_before = Pt(0)
+                        pf.space_after = Pt(0)
+                        pf.line_spacing_rule = WD_LINE_SPACING.SINGLE
+                        pf.line_spacing = 1
+    except Exception:
+        # Spacing is a visual enhancement only; never fail the pipeline over it.
+        return
+
+
+def _log_blocks(blocks, project_dir: str):
+    """Persist the LLM/segmenter output blocks for debugging (good vs bad runs)."""
+    try:
+        out_dir = os.path.join(project_dir, "output")
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, "last_blocks.json")
+        data = [
+            {"block_type": bt, "text": (text or "")}
+            for (bt, text) in (blocks or [])
+        ]
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"blocks": data, "num_blocks": len(data)}, f, indent=2, ensure_ascii=False)
+    except Exception:
+        # Logging must never break formatting; ignore failures.
+        return
 
 
 def _get_document_font_from_schema(schema: dict) -> str:
@@ -118,9 +176,12 @@ def process_document(generated_text, template_file):
         page_bytes = docx_to_page_images(single_column_path, dpi=150, max_pages=15)
         if page_bytes:
             schema["template_page_images"] = [base64.b64encode(b).decode("ascii") for b in page_bytes]
+            logging.info("Template page images: %s pages", len(schema["template_page_images"]))
             template_page_ocr_texts = ocr_page_images(page_bytes)
             if template_page_ocr_texts and any(t.strip() for t in template_page_ocr_texts):
                 schema["template_page_ocr_texts"] = template_page_ocr_texts
+        else:
+            logging.info("Template page images: none (conversion failed or no LibreOffice)")
         for path in (single_column_path, template_path):
             if path and os.path.isfile(path):
                 try:
@@ -128,10 +189,12 @@ def process_document(generated_text, template_file):
                 except OSError:
                     pass
     except Exception:
-        pass
+        logging.info("Template page images: none (conversion failed or no LibreOffice)")
 
     blocks = []
     try:
+        num_images = len(schema.get("template_page_images") or [])
+        logging.info("Sending to LLM: template_page_images=%s pages", num_images)
         blocks = format_text_with_llm(
             generated_text,
             schema,
@@ -147,6 +210,9 @@ def process_document(generated_text, template_file):
     if (not blocks or not has_any_content) and (generated_text or "").strip():
         para_style = (schema.get("style_map") or {}).get("paragraph") or "Normal"
         blocks = [(para_style, (generated_text or "").strip())]
+
+    # Write block list to disk so we can diff "good" vs "bad" runs for the same input.
+    _log_blocks(blocks, project_dir)
 
     clear_document_body(doc)
     # Preserve template's section/column layout (do not force single-column so two-column claimant/attorney blocks match template)
@@ -165,6 +231,7 @@ def process_document(generated_text, template_file):
     )
     document_font = _get_document_font_from_schema(schema)
     force_legal_run_format_document(doc, font_name=document_font)
+    _tighten_footer_spacing(doc)
     remove_trailing_empty_and_noise(doc)
 
     output_path = os.path.join(project_dir, "output", "formatted_output.docx")

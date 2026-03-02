@@ -1,12 +1,18 @@
 from dotenv import load_dotenv
 load_dotenv()
 
+import logging
+logging.basicConfig(level=logging.INFO)
+
 import os
 import re
 import streamlit as st
 from backend import extract_and_store_styles, process_document
 from utils.style_extractor import load_document_blueprint
 from utils.html_to_docx import html_to_docx_bytes, plain_text_to_simple_html, simple_html_to_plain_text
+from utils.docx_to_html import docx_to_html
+
+# st.set_page_config(layout="wide")
 
 # Base URL of the Flask app (CKEditor). Set CKEDITOR_FLASK_URL in .env if Flask runs elsewhere.
 CKEDITOR_FLASK_URL = os.environ.get("CKEDITOR_FLASK_URL", "http://127.0.0.1:5000")
@@ -108,7 +114,9 @@ if generated_text and template_file:
                 output_path, preview_text = process_document(generated_text, template_file)
                 st.session_state["formatted_output_path"] = output_path
                 st.session_state["formatted_editor"] = preview_text
-                st.session_state["formatted_editor_html"] = plain_text_to_simple_html(preview_text)
+                # Use alignment-aware HTML from the actual formatted DOCX so CKEditor
+                # shows a closer WYSIWYG preview of the downloaded document.
+                st.session_state["formatted_editor_html"] = docx_to_html(output_path)
                 st.session_state.pop("ckeditor_open_url", None)  # so user gets a fresh "Send to CKEditor" link
                 st.success("Document formatted successfully. Edit below with alignment and formatting, then download.")
             except Exception as e:
@@ -146,7 +154,7 @@ if st.session_state.get("formatted_output_path") or st.session_state.get("format
 
     # Single editor: Quill if available, else Lexical, else plain text
     if HAS_QUILL:
-        _col, _cap = st.columns([1, 5])
+        _col, _cap = st.columns([1, 10])
         with _col:
             if st.button("Add space", key="add_space_quill", help="Append a blank paragraph."):
                 current = st.session_state.get("formatted_editor_html") or initial_html
@@ -172,7 +180,7 @@ if st.session_state.get("formatted_output_path") or st.session_state.get("format
             st.session_state["formatted_editor_html"] = editor_content
         editor_html = st.session_state.get("formatted_editor_html") or initial_html
     elif HAS_LEXICAL:
-        _col, _cap = st.columns([1, 5])
+        _col, _cap = st.columns([1, 10])
         with _col:
             if st.button("Add space", key="add_space_lexical", help="Append a blank paragraph."):
                 current = st.session_state.get("formatted_editor_html") or initial_html
@@ -195,7 +203,7 @@ if st.session_state.get("formatted_output_path") or st.session_state.get("format
             st.session_state["formatted_editor_html"] = _markdown_to_html(md_content)
         editor_html = st.session_state.get("formatted_editor_html") or _markdown_to_html(initial_value)
     else:
-        _col, _cap = st.columns([1, 5])
+        _col, _cap = st.columns([1, 10])
         with _col:
             if st.button("Add space", key="add_space_plain", help="Append a blank paragraph."):
                 current = st.session_state.get("formatted_editor_html") or initial_html

@@ -1356,20 +1356,42 @@ def inject_blocks(doc, blocks, style_map=None, style_formatting=None, line_sampl
     seen_long_text = set()
 
     segments = _split_into_document_segments(blocks)
+    # Reuse the same left-column caption (court + parties) from the first segment
+    # on all subsequent segments, so the second page caption table looks like the first.
+    first_caption_left, first_caption_right = None, None
     for seg_idx, segment in enumerate(segments):
         if seg_idx > 0:
             doc.add_page_break()
         caption_left, caption_right, body_blocks = _split_caption_body(segment)
-        if caption_table_layout.get("use_table") and (caption_left or caption_right):
-            table = doc.add_table(rows=1, cols=2)
-            left_cell, right_cell = table.rows[0].cells[0], table.rows[0].cells[1]
-            if caption_left:
-                _render_caption_blocks_into_cell(left_cell, caption_left, style_map, style_formatting, valid_style_names, bold_phrases_from_template, right_align=False)
-            if caption_right:
-                _render_caption_blocks_into_cell(right_cell, caption_right, style_map, style_formatting, valid_style_names, bold_phrases_from_template, right_align=True)
-            blocks_to_render = body_blocks
+        if seg_idx == 0:
+            if caption_table_layout.get("use_table") and (caption_left or caption_right):
+                first_caption_left, first_caption_right = caption_left, caption_right
+                table = doc.add_table(rows=1, cols=2)
+                left_cell, right_cell = table.rows[0].cells[0], table.rows[0].cells[1]
+                if caption_left:
+                    _render_caption_blocks_into_cell(left_cell, caption_left, style_map, style_formatting, valid_style_names, bold_phrases_from_template, right_align=False)
+                if caption_right:
+                    _render_caption_blocks_into_cell(right_cell, caption_right, style_map, style_formatting, valid_style_names, bold_phrases_from_template, right_align=True)
+                blocks_to_render = body_blocks
+            else:
+                blocks_to_render = caption_left + caption_right + body_blocks if (caption_left or caption_right) else segment
         else:
-            blocks_to_render = caption_left + caption_right + body_blocks if (caption_left or caption_right) else segment
+            # For later segments, always reuse the first segment's left caption (court + parties)
+            # so the caption table on page 2+ matches page 1. Right column comes from the
+            # current segment (e.g. VERIFIED COMPLAINT vs SUMMONS).
+            if caption_table_layout.get("use_table"):
+                left_for_table = first_caption_left or caption_left
+                right_for_table = caption_right or first_caption_right
+                if left_for_table or right_for_table:
+                    table = doc.add_table(rows=1, cols=2)
+                    left_cell, right_cell = table.rows[0].cells[0], table.rows[0].cells[1]
+                    if left_for_table:
+                        _render_caption_blocks_into_cell(left_cell, left_for_table, style_map, style_formatting, valid_style_names, bold_phrases_from_template, right_align=False)
+                    if right_for_table:
+                        _render_caption_blocks_into_cell(right_cell, right_for_table, style_map, style_formatting, valid_style_names, bold_phrases_from_template, right_align=True)
+                blocks_to_render = body_blocks
+            else:
+                blocks_to_render = caption_left + caption_right + body_blocks if (caption_left or caption_right) else segment
         section_break_added_in_segment = False
 
         for block_type, text in blocks_to_render:
@@ -1556,24 +1578,28 @@ def inject_blocks(doc, blocks, style_map=None, style_formatting=None, line_sampl
                 if numbered_num_id is not None and is_any_numbered_point:
                     _apply_num_pr(p, numbered_num_id, numbered_ilvl)
                 _apply_section_spacing(p, txt_stripped, is_court_caption=is_court_caption)
-                _apply_default_paragraph_spacing(p, style, style_formatting)
-                if is_any_numbered_point:
-                    _apply_numbered_paragraph_layout(p)
-                align_type = "section_header" if style in (style_map.get("heading"), style_map.get("section_header")) else ("numbered" if is_any_numbered_point else "paragraph")
-                if align_type == "paragraph":
-                    _apply_default_body_indent(p, style, style_formatting)
-                if align_type in ("paragraph", "numbered"):
-                    _apply_default_line_spacing(p, style, style_formatting)
-                enforce_legal_alignment(align_type, p)
-                # Caption: left (court/parties), right (Index no., NOTICE OF MOTION), or center; TO:/address left
-                if _should_align_left_caption_block(txt_stripped):
-                    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                elif _should_align_right_caption(txt_stripped):
-                    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-                elif _should_align_center_caption(txt_stripped):
-                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                elif not _template_has_alignment(style, style_formatting) and _should_align_left_only(txt_stripped):
-                    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                # For court caption and footer caption lines (SUPERIOR/ SUPREME COURT, COUNTY OF, etc.),
+                # rely on the template's spacing/indent/alignment. Do not override with default
+                # paragraph spacing, body indent, or legal alignment heuristics.
+                if not is_court_caption:
+                    _apply_default_paragraph_spacing(p, style, style_formatting)
+                    if is_any_numbered_point:
+                        _apply_numbered_paragraph_layout(p)
+                    align_type = "section_header" if style in (style_map.get("heading"), style_map.get("section_header")) else ("numbered" if is_any_numbered_point else "paragraph")
+                    if align_type == "paragraph":
+                        _apply_default_body_indent(p, style, style_formatting)
+                    if align_type in ("paragraph", "numbered"):
+                        _apply_default_line_spacing(p, style, style_formatting)
+                    enforce_legal_alignment(align_type, p)
+                    # Caption/body alignment heuristics apply only outside the fixed caption/footer layouts.
+                    if _should_align_left_caption_block(txt_stripped):
+                        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                    elif _should_align_right_caption(txt_stripped):
+                        p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+                    elif _should_align_center_caption(txt_stripped):
+                        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    elif not _template_has_alignment(style, style_formatting) and _should_align_left_only(txt_stripped):
+                        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
                 if _looks_like_jurat_line(txt_stripped):
                     try:
                         p.paragraph_format.keep_with_next = True

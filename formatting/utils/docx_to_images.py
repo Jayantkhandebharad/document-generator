@@ -12,6 +12,7 @@ Optional: Tesseract OCR can be run on each page image to extract text for image-
 
 import base64
 import io
+import logging
 import os
 import shutil
 import subprocess
@@ -59,7 +60,11 @@ def _docx_to_pdf(docx_path: str) -> str | None:
         base = os.path.splitext(os.path.basename(docx_path))[0]
         pdf_path = os.path.join(out_dir, base + ".pdf")
         if os.path.isfile(pdf_path):
-            return pdf_path
+            # Copy to a temp file outside out_dir so it still exists after finally deletes out_dir
+            fd, dest = tempfile.mkstemp(suffix=".pdf")
+            os.close(fd)
+            shutil.copy2(pdf_path, dest)
+            return dest
         return None
     except (subprocess.TimeoutExpired, OSError):
         return None
@@ -120,11 +125,17 @@ def docx_to_page_images(docx_path: str, dpi: int = 150, max_pages: int = 15) -> 
     Returns list of PNG bytes; empty list if conversion fails (e.g. LibreOffice not installed).
     """
     pdf_path = _docx_to_pdf(docx_path)
+    if pdf_path is None:
+        logging.info("docx_to_page_images: DOCX→PDF failed or LibreOffice not found (pdf_path is None)")
+    else:
+        logging.info("docx_to_page_images: DOCX→PDF succeeded, pdf_path=%s", pdf_path)
     if not pdf_path:
         return []
     out_images = _pdf_to_page_images_fitz(pdf_path, dpi, max_pages)
+    logging.info("docx_to_page_images: PyMuPDF (fitz) returned %s page(s)", len(out_images))
     if not out_images:
         out_images = _pdf_to_page_images_pdf2image(pdf_path, dpi, max_pages)
+        logging.info("docx_to_page_images: pdf2image fallback returned %s page(s)", len(out_images))
     pdf_dir = os.path.dirname(pdf_path)
     docx_dir = os.path.dirname(os.path.abspath(docx_path))
     if pdf_dir != docx_dir:
