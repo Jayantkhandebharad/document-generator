@@ -27,7 +27,7 @@ class Config:
         
         self._gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
         self._gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview").strip()
-        self._gemini_vertex_ai = os.getenv("GEMINI_VERTEX_AI", "true").lower() == "true"
+        self._gemini_vertex_ai = os.getenv("GEMINI_VERTEX_AI", "false").lower() == "true"
         self._gemini_thinking_level = os.getenv("GEMINI_THINKING_LEVEL", "HIGH").strip()
         self._llm_provider = os.getenv("LLM_PROVIDER", "azure").strip().lower()
 

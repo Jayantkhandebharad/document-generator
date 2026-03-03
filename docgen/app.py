@@ -329,6 +329,10 @@ def run_pipeline():
             if f and f not in seen:
                 seen.add(f)
                 all_required.append(f)
+    
+    with st.expander("**Required fields**", expanded=True):
+        for f in all_required:
+            st.markdown(f"**{f}**")
 
     field_values = {}
     

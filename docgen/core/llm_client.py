@@ -22,13 +22,13 @@ class LLMClient:
         if self._provider == "gemini":
             try:
                 from google import genai
-                # Use VERTEX_AI env var to toggle vertexai mode if needed, default to False (AI Studio)
-                # or use snippet's vertexai=True if user explicitly set GOOGLE_CLOUD_API_KEY?
-                # For now, we use the API Key from config.
-                is_vertex = cfg.GEMINI_VERTEX_AI
+                # Use Vertex AI if configured or if key is a Vertex key (starts with AQ/AIza sy?)
+                # Actually, simply respect the config.
+                use_vertex = cfg.GEMINI_VERTEX_AI
+                api_key_val = (cfg.GEMINI_API_KEY or os.environ.get("GEMINI_API_KEY") or "").strip() or None
                 self._client = genai.Client(
-                    api_key=cfg.GEMINI_API_KEY,
-                    vertexai=is_vertex
+                    api_key=api_key_val,
+                    vertexai=use_vertex
                 )
                 self._model = cfg.GEMINI_MODEL
             except ImportError:
