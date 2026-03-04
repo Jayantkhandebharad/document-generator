@@ -67,6 +67,9 @@ from docgen.core.blueprint_manager import BlueprintManager
 # Sidebar
 # -------------------------
 with st.sidebar:
+    # Placeholder for logs at the very top of the sidebar
+    logs_placeholder = st.empty()
+    
     st.header("Configuration")
     llm_provider = st.radio(
         "LLM Provider", 
@@ -119,6 +122,12 @@ st.markdown(
         padding: 12px 0;
     }
     .progress-panel .fade-in { margin-bottom: 8px; }
+    
+    /* Increase sidebar width */
+    [data-testid="stSidebar"] {
+        min-width: 450px !important;
+        max-width: 600px !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -127,12 +136,35 @@ st.markdown(
 # -------------------------
 # Pipeline
 # -------------------------
-def run_pipeline():
+def run_pipeline(log_status=None, log_container=None):
+    _internal_logs = []
+    
+    def log(title, detail=None):
+        if log_status:
+            if title:
+                log_status.update(label=title)
+            if detail:
+                if log_container:
+                    _internal_logs.append(detail)
+                    # Use a CSS trick to force auto-scroll to bottom:
+                    # 'column-reverse' anchors to the bottom. We pass the reversed list so DOM is flipped but visually correct.
+                    html_lines = [f"<div style='margin-bottom: 8px;'>{l}</div>" for l in reversed(_internal_logs)]
+                    html = f"""
+                    <div style='max-height: 400px; overflow-y: auto; display: flex; flex-direction: column-reverse; color: #888888; font-size: 0.9em; padding-right: 8px;'>
+                        {"".join(html_lines)}
+                    </div>
+                    """
+                    log_container.markdown(html, unsafe_allow_html=True)
+                else:
+                    log_status.write(detail)
+
+    log("Initializing Pipeline", "Loading LLM Client...")
     llm_client = LLMClient(provider=os.getenv("LLM_PROVIDER", "azure"))
     question_generator = QuestionGenerator(llm_client=llm_client)
     
     # --- BLUEPRINT MANAGER ---
     bpm = BlueprintManager(blueprint_name, _root) if blueprint_name else None
+    log("Reading Documents", f"Blueprint: {blueprint_name or 'None'}")
     
     # --- LOAD / READ SAMPLES ---
     sample1_bytes = None
@@ -200,6 +232,7 @@ def run_pipeline():
     # =====================================================
     # STEP 0 — Category Identification
     # =====================================================
+    log("Identifying Category...", "Analyzing document types from samples.")
     category_of_document = None
     if bpm:
         category_of_document = bpm.load_text("category.txt")
@@ -211,11 +244,13 @@ def run_pipeline():
     else:
         st.caption("Loaded Category from Blueprint.")
 
+    log("Category Identified", f"Category: {category_of_document}")
 
     # =====================================================
     # STEP 1 — Section identification (fade-in, slow)
     # =====================================================
     st.subheader("Step 1 · Identifying document sections")
+    log("Identifying Sections...", "Dividing samples into logical sections.")
 
     sections = None
     if bpm:
@@ -252,6 +287,7 @@ def run_pipeline():
     # STEP 2 — Extraction + prompts (continuous loading steps, then arbitrators)
     # =====================================================
     st.subheader("Step 2 · Analyzing sample documents")
+    log("Extracting and Generating Prompts", "Extracting sections and generating templates.")
 
     extracted = None
     prompts = None
@@ -330,7 +366,7 @@ def run_pipeline():
                 seen.add(f)
                 all_required.append(f)
     
-    with st.expander("**Required fields**", expanded=True):
+    with st.expander("**Required fields**", expanded=False):
         for f in all_required:
             st.markdown(f"**{f}**")
 
@@ -343,6 +379,7 @@ def run_pipeline():
     if is_case_id:
         # Case 1: Case ID Search
         st.subheader("Step 3: Fetching data from Case Search")
+        log("Fetching Data from Search", f"Searching documents for Case ID {curl_input_clean}...")
         if all_required:
             status_placeholder = st.empty()
             progress = st.progress(0, text="Searching documents...")
@@ -350,11 +387,53 @@ def run_pipeline():
             def on_doc_progress(doc_name: str, index: int, total: int):
                 status_placeholder.markdown(f"**Scanning document {index}/{total}:** `{doc_name}`")
                 progress.progress(index / total, text=f"Scanning: {doc_name} ({index}/{total})")
+                log("Scanning Case Documents", f"Scanning {doc_name} ({index}/{total})")
         
         # --- Capture detailed results (confidence) via callback ---
         field_details = {}
+        collected_facts_list = []
+
+        st.markdown("### Live Extraction Progress")
+        col1, col2 = st.columns(2)
+        with col1:
+            live_fields_expander = st.expander("Live Fields Found", expanded=True)
+            live_fields_placeholder = live_fields_expander.empty()
+            live_fields_placeholder.markdown("*Waiting for first field...*")
+        with col2:
+            live_facts_expander = st.expander("Live Facts Collected", expanded=True)
+            live_facts_placeholder = live_facts_expander.empty()
+            live_facts_placeholder.markdown("*Waiting for facts...*")
+
+        def update_live_fields():
+            lines = []
+            for f, details in field_details.items():
+                val_str = str(details['value'])
+                if len(val_str) > 150: val_str = val_str[:150] + "..."
+                conf = str(details.get('confidence', '')).upper()
+                if "HIGH" in conf: conf_badge = "✅"
+                elif "PRUNED" in conf: conf_badge = "🚫"
+                elif "LOW" in conf: conf_badge = "⚠️"
+                else: conf_badge = "❓"
+                
+                # Using HTML for list item so it formats nicely in the scroll box
+                lines.append(f"<li>{conf_badge} <strong>{f}</strong>: {val_str}</li>")
+            if lines:
+                html = f'<div style="max-height: 300px; overflow-y: auto;"><ul>{"".join(lines)}</ul></div>'
+                live_fields_placeholder.markdown(html, unsafe_allow_html=True)
+
+        def update_live_facts():
+            if collected_facts_list:
+                lines = [f"<li>{fact}</li>" for fact in collected_facts_list]
+                html = f'<div style="max-height: 300px; overflow-y: auto;"><ol>{"".join(lines)}</ol></div>'
+                live_facts_placeholder.markdown(html, unsafe_allow_html=True)
+
         def on_field_found_callback(field, value, confidence):
             field_details[field] = {"value": value, "confidence": confidence}
+            update_live_fields()
+
+        def on_fact_found_callback(fact):
+            collected_facts_list.append(fact)
+            update_live_facts()
 
         # Fetch using the new search strategy
         field_values = field_fetcher.fetch_fields_from_case_search(
@@ -363,6 +442,7 @@ def run_pipeline():
             required_fields=all_required,
             on_doc_start=on_doc_progress,
             on_field_found=on_field_found_callback,
+            on_fact_found=on_fact_found_callback,
             category_of_document=category_of_document
         )
         
@@ -372,14 +452,17 @@ def run_pipeline():
         # --- Group fields by confidence ---
         high_conf = []
         low_conf = []
+        pruned_conf = []
         unrecognized = []
         
         for f in all_required:
             if f in field_details:
-                conf = field_details[f]["confidence"]
+                conf = str(field_details[f]["confidence"]).upper()
                 val = field_details[f]["value"]
-                if conf == "HIGH":
+                if "HIGH" in conf:
                     high_conf.append((f, val))
+                elif "PRUNED" in conf:
+                    pruned_conf.append((f, val))
                 else:
                     low_conf.append((f, val))
             elif f not in field_values:
@@ -399,6 +482,14 @@ def run_pipeline():
                     st.markdown(f"**{f}**: {vstr[:100]}...")
             else:
                 st.caption("No high confidence matches.")
+
+        with st.expander(f"Irrelevant / Pruned ({len(pruned_conf)})", expanded=True):
+            if pruned_conf:
+                for f, v in pruned_conf:
+                    vstr = str(v)
+                    st.markdown(f"🚫 **{f}**: {vstr}")
+            else:
+                st.caption("No fields pruned.")
 
         with st.expander(f"Low Confidence / Ambiguous ({len(low_conf)})", expanded=False):
             if low_conf:
@@ -491,6 +582,7 @@ def run_pipeline():
     # STEP 4 — Drafting (text_area, append-only, no headings)
     # =====================================================
     st.subheader("Step 4 · Drafting the document")
+    log("Drafting Document", "Generating document sections...")
 
     left, right = st.columns([3, 1])
 
@@ -507,6 +599,8 @@ def run_pipeline():
 
     for i, sec in enumerate(sections, start=1):
         section_name = sec["name"]
+        log(f"Drafting Section {i}/{total}", f"Working on: {section_name}")
+        
         req_fields = prompts[i - 1].get("required_fields", [])
         section_field_values = {f: field_values.get(f, "") for f in field_values} # passing all the things in case
         if ctx:
@@ -521,8 +615,15 @@ def run_pipeline():
             section_name=section_name,
         )
 
-        # ---- Append draft (NO headings)
-        draft_text += section_text.strip() + "\n\n"
+        # Check for Omission
+        is_skipped = "<<SECTION_SKIPPED>>" in section_text
+        if is_skipped:
+            section_text = "" # Clear text for assembly
+            display_name = f"🚫 {section_name} (Skipped)"
+        else:
+            draft_text += section_text.strip() + "\n\n"
+            display_name = section_name
+
         draft_sections.append(section_text)
 
         # ---- Increase height gradually
@@ -536,13 +637,13 @@ def run_pipeline():
             f"""
             <div class="progress-panel" style="min-height:{draft_height}px;">
                 <div class="fade-in" style="{fade_style}"><strong>Drafting section {i} of {total}</strong></div>
-                <div class="fade-in" style="{fade_style}"><strong>{section_name}</strong></div>
+                <div class="fade-in" style="{fade_style}"><strong>{display_name}</strong></div>
                 {completed_html}
             </div>
             """,
             unsafe_allow_html=True,
         )
-        completed_sections.append(section_name)
+        completed_sections.append(display_name)
 
         # ---- Left panel: single box
         with left:
@@ -572,6 +673,7 @@ def run_pipeline():
     # STEP 5 — Review, Polishing and formatting
     # =====================================================
     st.subheader("Step 5 · Reviewing, Polishing and formatting the document")
+    log("Reviewing and Polishing", "Assembling document and reviewing flow...")
 
     # 1. Assemble
     initial_draft = assembler.assemble(blueprint, draft_sections)
@@ -584,16 +686,20 @@ def run_pipeline():
             if reviewed_draft and len(reviewed_draft) > 100:
                 final_draft = reviewed_draft
                 st.success("Draft reviewed and polished.")
+                log("Review Complete", "Draft successfully polished.")
             else:
                 st.warning("Reviewer returned empty or too short text. Using initial draft.")
+                log("Review Skipped", "Using initial draft due to reviewer error.")
         except Exception as e:
             st.error(f"Review step failed: {e}. Using initial draft.")
+            log("Review Failed", f"Error: {e}")
 
     formatted_docx_bytes = None
     formatting_error = None
 
     # Use sample 1 as formatting template when it is a DOCX (run in subprocess so formatting's "utils" package is used)
     if s1_name and s1_name.lower().endswith(".docx") and sample1_bytes:
+        log("Formatting Document", "Applying DOCX template styles...")
         with st.status("Applying template formatting (styles & structure from Sample 1)…", state="running"):
             _formatting_dir = _root / "formatting"
             try:
@@ -830,14 +936,26 @@ def render_saved_pipeline_results():
 if st.button("Run document generation", type="primary"):
     st.session_state.pop("pipeline_done", None)  # clear so we run fresh
     status = st.empty()
-    status.info("Running pipeline…")
+    
+    with logs_placeholder.container():
+        st.markdown("### Process Logs")
+        log_status = st.status("Initializing...", expanded=True)
+        # Use an empty placeholder so we can overwrite it and force scroll-to-bottom
+        log_container = log_status.empty()
+        
     try:
-        run_pipeline()
+        run_pipeline(log_status, log_container)
     except Exception as e:
         status.empty()
         st.error("Pipeline failed. See details below.")
         st.exception(e)
+        log_status.update(label="Pipeline Failed", state="error")
     else:
         status.empty()
+        log_status.update(label="Pipeline Complete", state="complete")
+        
 elif st.session_state.get("pipeline_done"):
     render_saved_pipeline_results()
+    with logs_placeholder.container():
+        st.markdown("### Process Logs")
+        st.info("Pipeline completed. Logs are only available during active generation.")

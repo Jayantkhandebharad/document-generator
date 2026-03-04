@@ -547,7 +547,7 @@ Chunk Content:
 INSTRUCTIONS:
 1. Extract values for the target fields ONLY if present in the text.
 2. For each extracted value, assign a CONFIDENCE score ("HIGH" or "LOW").
-3. **ALSO EXTRACT "key_facts"**: Identify 3-5 key factual assertions, dates, or significant events found in this text that are relevant to the legal case (even if they don't match a specific field). Brief bullet points.
+3. **ALSO EXTRACT "key_facts"**: Identify key substantive facts, dates, injuries, or significant events relevant to the legal case. **CRITICAL:** Do NOT extract meta-information about the document itself (e.g. avoid facts like "This document is a blank template", "This is a letter to a hospital", "Signatures are missing"). Only extract actual case-related facts (e.g. "Incident occurred on Nov 16", "Plaintiff sustained foot injuries").
 4. Return a JSON object with keys: "items" (list of fields) and "key_facts" (list of strings).
 
 Example:
@@ -640,6 +640,93 @@ Example:
         
         return results, all_key_facts
 
+    def _prune_irrelevant_fields(
+        self, 
+        missing_fields: set[str], 
+        facts: list[str], 
+        category: str,
+        on_field_found: Callable[[str, str, str], None] | None = None
+    ) -> set[str]:
+        """
+        Uses LLM to evaluate if any of the missing fields are completely irrelevant 
+        to the current case based on the known facts and document category.
+        Returns the set of fields that are STILL relevant (i.e. missing_fields - irrelevant_fields).
+        """
+        if not facts or not missing_fields:
+            return missing_fields
+            
+        facts_text = "\n".join(f"- {f}" for f in facts[:80]) # limit to avoid huge prompt
+        fields_text = ", ".join(missing_fields)
+        
+        prompt = f"""You are a legal assistant. We are drafting a "{category}".
+We are trying to find values for these specific missing fields in the case documents: 
+[{fields_text}]
+
+Here are the known facts of the case we have collected so far:
+---
+{facts_text}
+---
+
+Based STRICTLY on the known facts and the category of the document, determine if any of these missing fields are clearly IRRELEVANT or INAPPLICABLE to this specific case. 
+For example, if the facts show this is a slip and fall involving only a foot injury, a field like "cervical_spine_mri" or "property_transfer_date" is completely irrelevant.
+
+Return a JSON array of objects for the fields from the list above that are DEFINITELY IRRELEVANT, along with the reason why they are irrelevant.
+If a field might still be relevant, or if it's standard boilerplate that could be missing, or if you are unsure, DO NOT include it in the irrelevant list.
+
+Example return format:
+{{
+    "irrelevant_fields": [
+        {{"field": "cervical_spine_mri", "reason": "The facts only mention a foot injury, no neck or spinal injuries."}},
+        {{"field": "loss_of_consortium_claim", "reason": "The facts state the plaintiff is single."}}
+    ]
+}}
+"""
+        schema = {
+            "type": "object",
+            "properties": {
+                "irrelevant_fields": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "field": {"type": "string"},
+                            "reason": {"type": "string"}
+                        },
+                        "required": ["field", "reason"],
+                        "additionalProperties": False
+                    }
+                }
+            },
+            "required": ["irrelevant_fields"],
+            "additionalProperties": False
+        }
+        
+        try:
+            resp = self._llm.generate(prompt, json_mode=True, max_tokens=2048, response_schema=schema)
+            from docgen.core.utils import JsonParser
+            data = JsonParser.extract_json_from_llm(resp)
+            if isinstance(data, dict) and "irrelevant_fields" in data:
+                irrelevant_list = data["irrelevant_fields"]
+                irrelevant_names = set(item.get("field") for item in irrelevant_list if isinstance(item, dict) and item.get("field"))
+                
+                # Intersect to ensure the LLM didn't hallucinate new field names
+                valid_irrelevant = irrelevant_names.intersection(missing_fields)
+                
+                if valid_irrelevant:
+                    for item in irrelevant_list:
+                        f_name = item.get("field")
+                        if f_name in valid_irrelevant:
+                            reason = item.get('reason')
+                            print(f"[FieldFetcher] Pruned irrelevant field '{f_name}': {reason}")
+                            if on_field_found:
+                                on_field_found(f_name, f"Irrelevant: {reason}", "PRUNED")
+                    
+                    return missing_fields - valid_irrelevant
+        except Exception as e:
+            print(f"[FieldFetcher] Error during field pruning: {e}")
+            
+        return missing_fields
+
     def fetch_fields_from_case_search(
         self,
         case_id: str | int,
@@ -647,6 +734,7 @@ Example:
         firm_id: str | int = 1,
         on_doc_start: Callable[[str, int, int], None] | None = None,
         on_field_found: Callable[[str, str, str], None] | None = None, # field, value, confidence
+        on_fact_found: Callable[[str], None] | None = None, # fact string
         category_of_document: str = "",
     ) -> dict[str, Any]:
         """
@@ -655,14 +743,89 @@ Example:
         ALSO accumulates key facts to generate a 'case_summary'.
         """
         from docgen.agents.data_retrieval.document_fetcher import DocumentFetcher
+        from docgen.agents.data_retrieval.case_data_manager import CaseDataManager
 
         print(f"\n[FieldFetcher] Starting search for case_id={case_id} (firm_id={firm_id})")
         print(f"[FieldFetcher] Required fields: {required_fields}")
 
-        missing_fields = set(required_fields)
+        # Initialize Data Manager and load cache
+        data_manager = CaseDataManager()
+        cached_data = data_manager.load_case_data(firm_id, case_id)
+        
         found_values = {}
         confused_values = {} 
         collected_facts = [] # List of strings
+
+        # 1. Load cached facts
+        if cached_data.get("facts"):
+            print(f"[FieldFetcher] Loaded {len(cached_data['facts'])} cached facts.")
+            collected_facts.extend(cached_data["facts"])
+            if on_fact_found:
+                for fact in cached_data["facts"]:
+                    on_fact_found(f"[Cache] {fact}")
+
+        # 2. Load cached fields
+        cached_fields = cached_data.get("fields", {})
+        for field in required_fields:
+            if field in cached_fields:
+                found_values[field] = cached_fields[field]
+                print(f"[FieldFetcher] Loaded cached value for '{field}'")
+                if on_field_found:
+                    on_field_found(field, cached_fields[field], "HIGH (Cache)")
+
+        # 3. Determine what is still missing
+        missing_fields = set(required_fields) - set(found_values.keys())
+
+        # 3.5. Try to extract missing fields directly from cached facts first
+        if missing_fields and collected_facts:
+            print(f"[FieldFetcher] Attempting to extract {len(missing_fields)} missing fields from {len(collected_facts)} cached facts...")
+            facts_text = "\n".join(f"- {f}" for f in collected_facts)
+            
+            # Split facts text if it's too long
+            fact_chunks = self._split_text(facts_text)
+            
+            for chunk in fact_chunks:
+                if not missing_fields:
+                    break
+                
+                chunk_results, _ = self._extract_fields_from_chunk(chunk, missing_fields)
+                
+                for field, res in chunk_results.items():
+                    if field not in missing_fields:
+                        continue
+                    val = res["value"]
+                    conf = res["confidence"]
+                    
+                    if on_field_found:
+                         on_field_found(field, val, f"{conf} (Extracted from Cache)")
+                         
+                    if conf == "HIGH":
+                        found_values[field] = val
+                        missing_fields.remove(field)
+                        print(f"[FieldFetcher]       >>> CONFIDENTLY FOUND '{field}' FROM CACHED FACTS")
+                        if field in confused_values:
+                            del confused_values[field]
+                    else:
+                        if field not in confused_values:
+                            confused_values[field] = val
+
+        # 4. Prune completely irrelevant missing fields based on known facts and case type
+        if missing_fields and collected_facts:
+            print(f"[FieldFetcher] Pruning {len(missing_fields)} missing fields based on {len(collected_facts)} known facts...")
+            missing_fields = self._prune_irrelevant_fields(
+                missing_fields, 
+                collected_facts, 
+                category_of_document,
+                on_field_found=on_field_found
+            )
+            print(f"[FieldFetcher] After pruning, {len(missing_fields)} fields remain to be searched.")
+
+        if not missing_fields and len(collected_facts) > 5:
+            # We have everything we need from cache
+            print("[FieldFetcher] All fields satisfied by cache and/or pruning. Skipping document search.")
+            summary = self._synthesize_case_summary(collected_facts, category_of_document)
+            found_values["case_summary"] = summary
+            return found_values
 
         # Using DocumentFetcher as a context manager ensures automatic cleanup of temp files
         with DocumentFetcher() as fetcher:
@@ -710,6 +873,9 @@ Example:
                     
                     # Accumulate facts
                     collected_facts.extend(chunk_facts)
+                    if on_fact_found:
+                        for fact in chunk_facts:
+                            on_fact_found(fact)
 
                     found_in_chunk = 0
                     for field, res in chunk_results.items():
@@ -744,6 +910,10 @@ Example:
                 found_values[k] = v
                 print(f"[FieldFetcher] Using LOW confidence value for '{k}': '{v}'")
         
+        # Save results to cache (only facts we found from this session, plus new fields)
+        if found_values or collected_facts:
+            data_manager.save_case_data(firm_id, case_id, found_values, collected_facts)
+
         # --- Synthesize Case Summary from Collected Facts ---
         if collected_facts:
             print(f"[FieldFetcher] Synthesizing case summary from {len(collected_facts)} collected facts...")
